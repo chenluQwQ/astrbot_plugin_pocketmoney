@@ -1435,7 +1435,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_sign_in")
     async def tool_sign_in(self, event: AstrMessageEvent):
-        '''签到。当用户说想签到、打卡、签个到之类的话时使用。每天只能签一次。
+        '''每日签到，获得经验和零花钱。
 
         Args:
         '''
@@ -1455,7 +1455,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_view_shop")
     async def tool_view_shop(self, event: AstrMessageEvent):
-        '''查看今日超市有哪些商品在售。在想买东西或用户提到超市时使用。
+        '''查看今日超市商品。
 
         Args:
         '''
@@ -1463,7 +1463,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_buy_item")
     async def tool_buy_item(self, event: AstrMessageEvent, item_name: str):
-        '''从超市购买指定商品。购买前请先用pm_view_shop查看有什么。
+        '''买超市商品，入共享背包。
 
         Args:
             item_name(string): 商品名称
@@ -1494,7 +1494,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_view_stocks")
     async def tool_view_stocks(self, event: AstrMessageEvent):
-        '''查看今日股市行情。在想炒股或用户提到股票时使用。
+        '''查看今日股市行情。
 
         Args:
         '''
@@ -1506,8 +1506,8 @@ class PocketMoneyPlugin(Star):
         '''买入股票。
 
         Args:
-            code(string): 股票代码，如 NEKO
-            shares(string): 买入数量
+            code(string): 股票代码
+            shares(string): 数量
         '''
         user_id = event.get_sender_id()
         money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
@@ -1539,7 +1539,7 @@ class PocketMoneyPlugin(Star):
 
         Args:
             code(string): 股票代码
-            shares(string): 卖出数量
+            shares(string): 数量
         '''
         user_id = event.get_sender_id()
         money_mgr, _, _ = self._get_managers_for_user(user_id)
@@ -1558,7 +1558,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_check_balance")
     async def tool_check_balance(self, event: AstrMessageEvent):
-        '''查看当前零花钱余额和背包状态。
+        '''查看余额和背包。
 
         Args:
         '''
@@ -1570,7 +1570,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_play_scratch")
     async def tool_play_scratch(self, event: AstrMessageEvent):
-        '''玩刮刮乐。
+        '''刮刮乐，3元一张。
 
         Args:
         '''
@@ -1594,7 +1594,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_give_to_user")
     async def tool_give_to_user(self, event: AstrMessageEvent, item_name: str):
-        '''把自己背包里的东西送给当前正在说话的用户。用户说"我想要你的XX"之类的时候使用。
+        '''把共享背包的物品送给当前用户，放入其专属格子。
 
         Args:
             item_name(string): 物品名称
@@ -1628,10 +1628,10 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_use_user_item")
     async def tool_use_user_item(self, event: AstrMessageEvent, item_name: str):
-        '''使用/消耗用户专属格子里的物品。用户说"吃掉XX""用掉XX""丢掉XX"之类的时候使用。
+        '''消耗/丢弃用户格子或背包里的物品。
 
         Args:
-            item_name(string): 要使用的物品名称
+            item_name(string): 物品名称
         '''
         user_id = event.get_sender_id()
         _, backpack_mgr, _ = self._get_managers_for_user(user_id)
@@ -1644,11 +1644,11 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_gift_item")
     async def tool_gift_item(self, event: AstrMessageEvent, item_name: str, to_user: str):
-        '''跨bot赠送：把物品送给另一个bot管理的用户。会发出固定格式赠送消息等待对方bot接收。
+        '''跨bot赠送物品。
 
         Args:
-            item_name(string): 要赠送的物品名称
-            to_user(string): 赠送对象的名字
+            item_name(string): 物品名称
+            to_user(string): 对象名字
         '''
         if not self._gift_bot_name:
             return "赠送功能未配置bot名称（gift_bot_name）"
