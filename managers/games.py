@@ -33,9 +33,11 @@ class GamesManager:
                 data.setdefault("stock_date", "")
                 data.setdefault("user_portfolios", {})
                 data.setdefault("scratch_stats", {})
+                data.setdefault("slots_stats", {})
                 return data
         except (json.JSONDecodeError, TypeError):
-            return {"stocks": {}, "stock_date": "", "user_portfolios": {}, "scratch_stats": {}}
+            return {"stocks": {}, "stock_date": "", "user_portfolios": {}, "scratch_stats": {},
+                    "slots_stats": {}}
 
     def _save_data(self):
         path = os.path.join(self.data_dir, "games.json")
@@ -370,3 +372,82 @@ class GamesManager:
         total_profit_str = f"+{total_profit}" if total_profit >= 0 else str(total_profit)
         lines.append(f"\n💰 总市值：{round(total_value, 2)}元 | 总盈亏：{total_profit_str}元")
         return "\n".join(lines)
+
+    # ============================================================
+    #  老虎机
+    # ============================================================
+
+    # 符号定义：(emoji, 名称, 三连倍率, 权重)
+    # 权重越高越常见；三连倍率是相对投币额的倍数
+    SLOT_SYMBOLS = [
+        ("🍒", "樱桃", 3, 30),
+        ("🍋", "柠檬", 4, 25),
+        ("🍊", "橘子", 5, 20),
+        ("🔔", "铃铛", 8, 14),
+        ("⭐", "星星", 12, 7),
+        ("💎", "钻石", 20, 3),
+        ("7️⃣", "幸运7", 50, 1),
+    ]
+
+    def _spin_reel(self) -> Tuple[str, str]:
+        """转一个轮子，返回 (emoji, 名称)"""
+        pool = []
+        for emoji, name, _, weight in self.SLOT_SYMBOLS:
+            pool.extend([(emoji, name)] * weight)
+        return random.choice(pool)
+
+    def play_slots(self, user_id: str, bet: float = None) -> Tuple[str, float, float, List[str]]:
+        """
+        玩老虎机
+        :param bet: 投币额，默认从配置读取
+        :return: (结果描述, 奖金, 投入, [reel1_emoji, reel2_emoji, reel3_emoji])
+        """
+        if bet is None:
+            bet = self.config.get("slots_bet", 5)
+
+        # 转三个轮子
+        r1_emoji, r1_name = self._spin_reel()
+        r2_emoji, r2_name = self._spin_reel()
+        r3_emoji, r3_name = self._spin_reel()
+        reels = [r1_emoji, r2_emoji, r3_emoji]
+
+        # 判定结果
+        if r1_emoji == r2_emoji == r3_emoji:
+            # 三连！查找倍率
+            multiplier = 3  # 默认
+            for emoji, name, mult, _ in self.SLOT_SYMBOLS:
+                if emoji == r1_emoji:
+                    multiplier = mult
+                    break
+            winnings = round(bet * multiplier, 2)
+            desc = f"🎰 三连{r1_name}！ x{multiplier}倍"
+        elif r1_emoji == r2_emoji or r2_emoji == r3_emoji or r1_emoji == r3_emoji:
+            # 两个相同 = 回本
+            winnings = round(bet * 1.5, 2)
+            desc = "🎰 两个相同，小赚一笔~"
+        else:
+            winnings = 0
+            desc = "🎰 没有匹配，再试试运气！"
+
+        # 记录统计
+        stats = self.data.setdefault("slots_stats", {})
+        user_stats = stats.setdefault(user_id, {
+            "played": 0, "spent": 0, "won": 0, "jackpots": 0, "best_multi": 0
+        })
+        user_stats["played"] += 1
+        user_stats["spent"] = round(user_stats["spent"] + bet, 2)
+        user_stats["won"] = round(user_stats["won"] + winnings, 2)
+        if r1_emoji == r2_emoji == r3_emoji:
+            user_stats["jackpots"] += 1
+            for emoji, _, mult, _ in self.SLOT_SYMBOLS:
+                if emoji == r1_emoji and mult > user_stats.get("best_multi", 0):
+                    user_stats["best_multi"] = mult
+        self._save_data()
+
+        return desc, winnings, bet, reels
+
+    def get_slots_stats(self, user_id: str) -> Dict:
+        """获取用户老虎机统计"""
+        return self.data.get("slots_stats", {}).get(
+            user_id, {"played": 0, "spent": 0, "won": 0, "jackpots": 0, "best_multi": 0}
+        )

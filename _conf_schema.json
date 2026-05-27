@@ -51,6 +51,12 @@
                 "type": "int",
                 "default": 2,
                 "hint": "每日签到奖励的零花钱"
+            },
+            "slots_bet": {
+                "description": "老虎机默认投币",
+                "type": "int",
+                "default": 5,
+                "hint": "老虎机默认每次投币金额，玩家也可自选金额"
             }
         }
     },

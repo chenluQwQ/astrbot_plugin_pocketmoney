@@ -84,6 +84,7 @@ class PocketMoneyPlugin(Star):
             self.data_dir,
             {
                 "scratch_ticket_price": cfg("scratch_ticket_price", 3),
+                "slots_bet": cfg("slots_bet", 5),
             },
         )
         self.level_manager = LevelManager(self.data_dir)
@@ -104,6 +105,7 @@ class PocketMoneyPlugin(Star):
                 "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
                 "pm_buy_stock", "pm_sell_stock", "pm_check_balance",
                 "pm_play_scratch", "pm_give_to_user", "pm_use_user_item", "pm_gift_item",
+                "pm_play_slots",
             ]:
                 try:
                     self.context.activate_llm_tool(tool_name)
@@ -1233,6 +1235,78 @@ class PocketMoneyPlugin(Star):
         self._check_achievements(user_id)
 
     # ===============================================================
+    #  小游戏：老虎机
+    # ===============================================================
+
+    @filter.command("老虎机")
+    async def play_slots(self, event: AstrMessageEvent, bet_str: str = ""):
+        """玩老虎机"""
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        default_bet = self._cfg("slots_bet", 5)
+        if bet_str.strip():
+            ok, bet = self._parse_amount(bet_str)
+            if not ok:
+                yield event.plain_result(f"错误：{bet}"); return
+        else:
+            bet = default_bet
+
+        if bet > money_mgr.get_balance():
+            yield event.plain_result(
+                f"余额不足！投币 {bet}元，当前余额 {money_mgr.get_balance()}元"
+            ); return
+
+        # 扣钱
+        money_mgr.add_expense(bet, "老虎机", user_id, isolation=is_isolated)
+        if is_isolated:
+            self.isolation_manager.add_pending_refund(bet, "老虎机", user_id)
+
+        # 转！
+        desc, winnings, _, reels = self.games_manager.play_slots(user_id, bet)
+        net = round(winnings - bet, 2)
+
+        # 赢了就加回
+        if winnings > 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
+            money_mgr._save_data()
+            self.level_manager.add_xp(user_id, 5, "老虎机赢了")
+            yield event.plain_result(
+                f"🎰 ┃ {reels[0]} ┃ {reels[1]} ┃ {reels[2]} ┃\n"
+                f"{desc}\n"
+                f"💰 奖金 {winnings}元（净赚 +{net}元）\n"
+                f"💳 余额：{money_mgr.get_balance()}元"
+            )
+        else:
+            yield event.plain_result(
+                f"🎰 ┃ {reels[0]} ┃ {reels[1]} ┃ {reels[2]} ┃\n"
+                f"{desc}\n"
+                f"💸 投入 {bet}元\n"
+                f"💳 余额：{money_mgr.get_balance()}元"
+            )
+
+        self._check_achievements(user_id)
+
+    @filter.command("老虎机统计")
+    async def slots_stats(self, event: AstrMessageEvent):
+        """查看老虎机统计"""
+        user_id = event.get_sender_id()
+        stats = self.games_manager.get_slots_stats(user_id)
+        if stats["played"] == 0:
+            yield event.plain_result("你还没玩过老虎机呢，试试「老虎机」或「老虎机 <金额>」吧~"); return
+        net = round(stats["won"] - stats["spent"], 2)
+        net_str = f"+{net}" if net >= 0 else str(net)
+        best = f"最高{stats['best_multi']}倍" if stats.get("best_multi", 0) > 0 else "暂无"
+        yield event.plain_result(
+            f"🎰 你的老虎机统计：\n"
+            f"  🎮 玩了 {stats['played']} 次\n"
+            f"  💸 投入 {stats['spent']}元\n"
+            f"  💰 赢得 {stats['won']}元\n"
+            f"  📊 净盈亏 {net_str}元\n"
+            f"  🏆 三连次数 {stats.get('jackpots', 0)}次（{best}）"
+        )
+
+    # ===============================================================
     #  帮助菜单
     # ===============================================================
 
@@ -1247,6 +1321,7 @@ class PocketMoneyPlugin(Star):
             "  逛超市 | 购买 <编号>\n\n"
             "🎮 小游戏\n"
             "  刮刮乐 | 刮刮乐统计\n"
+            "  老虎机 [金额] | 老虎机统计\n"
             "  猜大 <金额> | 猜小 <金额>\n"
             "  股市 | 买股票 <代码> <数量> | 卖股票 <代码> <数量> | 我的股票\n\n"
             "🎒 背包\n"
@@ -1587,6 +1662,26 @@ class PocketMoneyPlugin(Star):
             money_mgr._save_data()
         net = round(winnings - ticket_price, 2)
         return f"刮刮乐结果：{prize_name}！奖金{winnings}元（净{'+' if net>=0 else ''}{net}元），余额{money_mgr.get_balance()}元"
+
+    @llm_tool(name="pm_play_slots")
+    async def tool_play_slots(self, event: AstrMessageEvent):
+        '''老虎机，默认5元一次，三个相同符号大奖。
+
+        Args:
+        '''
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+        bet = self._cfg("slots_bet", 5)
+        if bet > money_mgr.get_balance():
+            return f"余额不足，需要{bet}元"
+
+        money_mgr.add_expense(bet, "老虎机", user_id, isolation=is_isolated)
+        desc, winnings, _, reels = self.games_manager.play_slots(user_id, bet)
+        if winnings > 0:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
+            money_mgr._save_data()
+        net = round(winnings - bet, 2)
+        return f"老虎机：┃{reels[0]}┃{reels[1]}┃{reels[2]}┃ {desc}。{'奖金' + str(winnings) + '元，净' + ('+' if net>=0 else '') + str(net) + '元' if winnings > 0 else '没中，-' + str(bet) + '元'}，余额{money_mgr.get_balance()}元"
 
     # ===============================================================
     #  跨bot赠送系统
