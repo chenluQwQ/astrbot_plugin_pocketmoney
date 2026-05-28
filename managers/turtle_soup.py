@@ -184,6 +184,18 @@ class TurtleSoupManager:
         })
         self._save_data()
 
+    def get_cached_titles(self) -> List[str]:
+        """获取缓存中所有未过期题目的标题（用于搜索排除）"""
+        now = time.time()
+        titles = []
+        for entry in self.data.get("cached_online", []):
+            if now - entry.get("fetched_at", 0) > self.ONLINE_CACHE_TTL:
+                continue
+            t = entry.get("puzzle", {}).get("title", "")
+            if t:
+                titles.append(t)
+        return titles
+
     def get_cached_online_puzzle(self, exclude_fps: set = None) -> Optional[Dict]:
         """从缓存中随机取一道未过期的题目（可排除指定指纹）"""
         now = time.time()
@@ -254,8 +266,12 @@ class TurtleSoupManager:
     # ========== LLM Prompt ==========
 
     @staticmethod
-    def build_search_prompt() -> str:
+    def build_search_prompt(exclude_titles: list = None) -> str:
         """构建让 LLM 联网搜索海龟汤题目的 prompt（兼容 Bocha/Tavily/Grok/OpenAI）"""
+        exclude_hint = ""
+        if exclude_titles:
+            titles_str = "、".join(exclude_titles[:10])
+            exclude_hint = f"5. 不要选以下已经出过的题目：{titles_str}\n"
         return (
             "请使用联网搜索功能，搜索一道有趣的「海龟汤」（情境猜谜/横向思维谜题）题目。\n"
             "搜索关键词建议：海龟汤 情境猜谜 横向思维 谜题 汤面 汤底\n\n"
@@ -263,7 +279,8 @@ class TurtleSoupManager:
             "1. 从搜索结果中找到一道完整的海龟汤题目（必须同时包含汤面和汤底）\n"
             "2. 如果搜索结果中没有完整题目，可以基于搜索到的素材整理一道\n"
             "3. 汤面要简短有悬念（1-3句话），汤底要合理有反转（3-5句话）\n"
-            "4. 不要太恐怖或血腥\n\n"
+            "4. 不要太恐怖或血腥\n"
+            f"{exclude_hint}\n"
             "请严格按以下 JSON 格式返回，不要有任何其他内容（不要 markdown 代码块）：\n"
             '{"title": "简短标题", "surface": "汤面内容", "answer": "汤底内容"}'
         )

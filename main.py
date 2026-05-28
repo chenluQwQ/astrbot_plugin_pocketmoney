@@ -1383,7 +1383,7 @@ class PocketMoneyPlugin(Star):
             f"🐢 海龟汤开始！—— {title} {pid_display}\n\n"
             f"📜 汤面：\n{puzzle['surface']}\n\n"
             f"直接发消息提问，我只回答「是/不是/不相关」\n"
-            f"💡 揭晓汤底 | 换汤 | 退出海龟汤"
+            f"💡 猜汤底 <猜测> | 揭晓汤底 | 换汤 | 退出海龟汤"
         )
 
     @filter.command("揭晓汤底")
@@ -1395,6 +1395,99 @@ class PocketMoneyPlugin(Star):
             yield event.plain_result("🐢 当前没有进行中的海龟汤~"); return
         self.turtle_soup_manager.record_reveal()
         yield event.plain_result(f"🐢 汤底揭晓：\n\n{puzzle['answer']}")
+
+    @filter.command("猜汤底")
+    async def guess_soup(self, event: AstrMessageEvent, guess: str = ""):
+        """猜测汤底，LLM 判断是否大体正确"""
+        session_key = TurtleSoupManager.get_session_key(event)
+        puzzle = self.turtle_soup_manager.get_active_soup(session_key)
+        if not puzzle:
+            yield event.plain_result("🐢 当前没有进行中的海龟汤~"); return
+
+        guess = guess.strip()
+        if not guess:
+            yield event.plain_result("🐢 用法：猜汤底 <你的猜测>\n例如：猜汤底 那个人其实已经死了"); return
+
+        # 调用 LLM 判断猜测与汤底的相似度
+        answer = puzzle.get("answer", "")
+        try:
+            umo = event.unified_msg_origin
+            prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if not prov_id:
+                yield event.plain_result("🐢 无法调用判定，请直接「揭晓汤底」查看答案"); return
+
+            judge_prompt = (
+                "你是海龟汤游戏裁判。请判断玩家的猜测是否与汤底的核心真相大体一致。\n\n"
+                f"【汤底（标准答案）】：{answer}\n"
+                f"【玩家猜测】：{guess}\n\n"
+                "判断标准：玩家不需要说出每个细节，只要抓住了核心反转/关键真相即算正确。\n"
+                "请严格按以下 JSON 格式返回，不要有任何其他内容：\n"
+                '{"correct": true或false, "comment": "一句话点评"}'
+            )
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=prov_id, prompt=judge_prompt,
+            )
+
+            # 提取判定结果
+            resp_text = ""
+            try:
+                resp_text = llm_resp.completion_text or ""
+            except Exception:
+                pass
+            if not resp_text.strip():
+                for attr in ("raw_completion", "text", "content"):
+                    try:
+                        val = getattr(llm_resp, attr, None)
+                        if val and isinstance(val, str) and val.strip():
+                            resp_text = val; break
+                    except Exception:
+                        pass
+
+            result = self._parse_puzzle_json_generic(resp_text)
+
+            if result and result.get("correct"):
+                # 猜对了 → 公布汤底并结束
+                self.turtle_soup_manager.clear_active_soup(session_key)
+                self.turtle_soup_manager.record_reveal()
+                comment = result.get("comment", "")
+                yield event.plain_result(
+                    f"🎉 恭喜猜对了！{comment}\n\n"
+                    f"🐢 汤底：\n{answer}"
+                )
+            elif result:
+                comment = result.get("comment", "还差一点，继续猜~")
+                yield event.plain_result(f"🐢 {comment}\n💡 继续提问或再猜一次~")
+            else:
+                yield event.plain_result("🐢 判定失败了，再试一次或直接「揭晓汤底」")
+
+        except Exception as e:
+            logger.warning(f"[TurtleSoup] 猜汤底判定异常: {e}")
+            yield event.plain_result("🐢 判定出错了，请直接「揭晓汤底」查看答案")
+
+    @staticmethod
+    def _parse_puzzle_json_generic(text: str) -> Optional[dict]:
+        """通用 JSON 提取（用于猜汤底判定等）"""
+        import re
+        if not text:
+            return None
+        text = text.strip()
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        code_block = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if code_block:
+            try:
+                return json.loads(code_block.group(1))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        brace_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if brace_match:
+            try:
+                return json.loads(brace_match.group(0))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
 
     @filter.command("换汤")
     async def swap_soup(self, event: AstrMessageEvent):
@@ -1456,7 +1549,7 @@ class PocketMoneyPlugin(Star):
         return False
 
     async def _generate_soup_online(self, event: AstrMessageEvent) -> Optional[dict]:
-        """通过搜索 API 联网查找海龟汤（带10天去重缓存）"""
+        """通过搜索 API 联网查找海龟汤（随机关键词 + 排除已出题 + 最多重试3次）"""
         search_type = self._cfg("soup_search_type", "").strip().lower()
         search_key = self._cfg("soup_search_key", "")
         custom_url = self._cfg("soup_search_url", "").strip()
@@ -1475,7 +1568,7 @@ class PocketMoneyPlugin(Star):
             elif any(k in url_lower for k in ("openai", "x.ai", "grok")):
                 search_type = "grok" if "x.ai" in url_lower or "grok" in url_lower else "openai"
             else:
-                search_type = "tavily"  # 默认尝试 tavily 格式
+                search_type = "tavily"
             logger.info(f"[TurtleSoup] 从 URL 自动推断搜索类型: {search_type}")
 
         if not search_type:
@@ -1492,48 +1585,83 @@ class PocketMoneyPlugin(Star):
         except ImportError:
             logger.error("[TurtleSoup] 需要 aiohttp 库"); return None
 
-        puzzle = None
-        try:
-            if search_type == "tavily":
-                raw_text = await self._search_tavily(search_url, search_key)
-                if raw_text:
-                    puzzle = await self._parse_search_results(event, raw_text)
+        # 获取已出过的题目标题，用于排除
+        cached_titles = self.turtle_soup_manager.get_cached_titles()
 
-            elif search_type == "bocha":
-                raw_text = await self._search_bocha(search_url, search_key)
-                if raw_text:
-                    puzzle = await self._parse_search_results(event, raw_text)
+        # 最多重试 3 次（每次用不同关键词）
+        max_retries = 3
+        used_queries = set()
 
-            elif search_type in ("openai", "grok"):
-                puzzle = await self._search_chat_api(search_url, search_key, search_type)
+        for attempt in range(max_retries):
+            query = self._random_soup_query()
+            # 尽量不重复同一组关键词
+            retry_count = 0
+            while query in used_queries and retry_count < 5:
+                query = self._random_soup_query()
+                retry_count += 1
+            used_queries.add(query)
 
-            else:
-                raw_text = await self._search_tavily(search_url, search_key)
-                if not raw_text:
-                    raw_text = await self._search_bocha(search_url, search_key)
-                if raw_text:
-                    puzzle = await self._parse_search_results(event, raw_text)
+            puzzle = None
+            try:
+                if search_type == "tavily":
+                    raw_text = await self._search_tavily(search_url, search_key, query)
+                    if raw_text:
+                        puzzle = await self._parse_search_results(event, raw_text, cached_titles)
 
-        except Exception as e:
-            logger.warning(f"[TurtleSoup] 在线搜索失败: {e}")
+                elif search_type == "bocha":
+                    raw_text = await self._search_bocha(search_url, search_key, query)
+                    if raw_text:
+                        puzzle = await self._parse_search_results(event, raw_text, cached_titles)
 
-        if puzzle:
-            # 去重：10天内出过的同一道题不再出
-            if self.turtle_soup_manager.is_duplicate_online(puzzle):
-                logger.info(f"[TurtleSoup] 在线题目重复（10天内已出过），跳过: {puzzle.get('title')}")
-                return None
-            # 缓存 + 分配编号
-            self.turtle_soup_manager.cache_online_puzzle(puzzle)
-            puzzle["id"] = self.turtle_soup_manager.next_online_id()
-            logger.info(f"[TurtleSoup] 在线搜索成功: {puzzle['id']} {puzzle.get('title')}")
-        return puzzle
+                elif search_type in ("openai", "grok"):
+                    puzzle = await self._search_chat_api(search_url, search_key, search_type, cached_titles)
 
-    async def _search_tavily(self, url: str, key: str) -> Optional[str]:
+                else:
+                    raw_text = await self._search_tavily(search_url, search_key, query)
+                    if not raw_text:
+                        raw_text = await self._search_bocha(search_url, search_key, query)
+                    if raw_text:
+                        puzzle = await self._parse_search_results(event, raw_text, cached_titles)
+
+            except Exception as e:
+                logger.warning(f"[TurtleSoup] 在线搜索第{attempt+1}次失败: {e}")
+                continue
+
+            if puzzle:
+                if self.turtle_soup_manager.is_duplicate_online(puzzle):
+                    logger.info(f"[TurtleSoup] 第{attempt+1}次搜索结果重复，换关键词重试: {puzzle.get('title')}")
+                    continue
+                # 成功 → 缓存 + 分配编号
+                self.turtle_soup_manager.cache_online_puzzle(puzzle)
+                puzzle["id"] = self.turtle_soup_manager.next_online_id()
+                logger.info(f"[TurtleSoup] 在线搜索成功(第{attempt+1}次): {puzzle['id']} {puzzle.get('title')}")
+                return puzzle
+
+        logger.warning(f"[TurtleSoup] {max_retries}次搜索均未找到新题")
+        return None
+
+    # 多组搜索关键词，随机轮换避免总搜到同一道
+    _SOUP_SEARCH_QUERIES = [
+        "海龟汤 情境猜谜 横向思维 汤面 汤底 题目",
+        "海龟汤 经典题目 情境推理 谜题",
+        "横向思维谜题 海龟汤 脑洞题 有趣",
+        "海龟汤 推理 悬疑故事 猜谜 题库",
+        "情境猜谜 是不是 汤面汤底 合集",
+        "海龟汤题目大全 横向思维 推理小故事",
+        "海龟汤 新题 冷门 有意思的",
+        "lateral thinking puzzle 海龟汤 中文",
+    ]
+
+    def _random_soup_query(self) -> str:
+        """随机选一组搜索关键词"""
+        return random.choice(self._SOUP_SEARCH_QUERIES)
+
+    async def _search_tavily(self, url: str, key: str, query: str = "") -> Optional[str]:
         """Tavily Search API"""
         import aiohttp
         body = {
             "api_key": key,
-            "query": "海龟汤 情境猜谜 横向思维 汤面 汤底 题目",
+            "query": query or self._random_soup_query(),
             "max_results": 5,
             "search_depth": "advanced",
         }
@@ -1548,11 +1676,11 @@ class PocketMoneyPlugin(Star):
             for r in results[:5]
         )
 
-    async def _search_bocha(self, url: str, key: str) -> Optional[str]:
+    async def _search_bocha(self, url: str, key: str, query: str = "") -> Optional[str]:
         """Bocha (博查) Search API"""
         import aiohttp
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        body = {"query": "海龟汤 情境猜谜 横向思维 汤面 汤底", "count": 5, "summary": True}
+        body = {"query": query or self._random_soup_query(), "count": 5, "summary": True}
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 data = await resp.json()
@@ -1564,11 +1692,11 @@ class PocketMoneyPlugin(Star):
             for p in pages[:5]
         )
 
-    async def _search_chat_api(self, url: str, key: str, search_type: str) -> Optional[dict]:
+    async def _search_chat_api(self, url: str, key: str, search_type: str, exclude_titles: list = None) -> Optional[dict]:
         """OpenAI / Grok(xAI) 兼容的 Chat API（自带联网）"""
         import aiohttp
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        prompt = TurtleSoupManager.build_search_prompt()
+        prompt = TurtleSoupManager.build_search_prompt(exclude_titles=exclude_titles)
 
         # 自动选 model
         if search_type == "grok":
@@ -1589,7 +1717,7 @@ class PocketMoneyPlugin(Star):
         text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         return self._parse_puzzle_json(text)
 
-    async def _parse_search_results(self, event: AstrMessageEvent, raw_text: str) -> Optional[dict]:
+    async def _parse_search_results(self, event: AstrMessageEvent, raw_text: str, exclude_titles: list = None) -> Optional[dict]:
         """将搜索原始结果交给当前 LLM 提取成固定格式 puzzle"""
         try:
             umo = event.unified_msg_origin
@@ -1597,10 +1725,17 @@ class PocketMoneyPlugin(Star):
             if not prov_id:
                 logger.warning("[TurtleSoup] 无法获取 chat_provider_id")
                 return None
+
+            exclude_hint = ""
+            if exclude_titles:
+                titles_str = "、".join(exclude_titles[:10])
+                exclude_hint = f"【重要】不要选以下已经出过的题目：{titles_str}\n\n"
+
             prompt = (
                 "以下是网上搜索到的海龟汤相关内容，请从中提取一道完整的海龟汤题目。\n"
                 "如果搜索结果中有多道题，随机选一道。\n"
                 "如果没有完整题目，请基于搜索内容整理一道。\n\n"
+                f"{exclude_hint}"
                 f"--- 搜索结果 ---\n{raw_text[:3000]}\n--- 结束 ---\n\n"
                 "请严格按以下 JSON 格式返回，不要有任何其他内容（不要 markdown 代码块）：\n"
                 '{"title": "简短标题", "surface": "汤面内容", "answer": "汤底内容"}'
@@ -1752,7 +1887,7 @@ class PocketMoneyPlugin(Star):
             listing = listing.replace("🌐 在线搜索：开启", "🔒 在线搜索：未配置")
         yield event.plain_result(listing)
 
-    @filter.command("海龟汤诊断")
+    # 诊断方法（保留，不注册指令，需要时可手动调用或临时加回装饰器）
     async def diagnose_soup(self, event: AstrMessageEvent):
         """逐步诊断海龟汤在线搜索"""
         lines = ["🔧 海龟汤在线搜索诊断\n"]
@@ -1906,7 +2041,7 @@ class PocketMoneyPlugin(Star):
             "  股市 | 买股票 <代码> <数量> | 卖股票 <代码> <数量> | 我的股票\n\n"
             "🐢 海龟汤\n"
             "  海龟汤 [编号] | 海龟汤列表 | 海龟汤搜索\n"
-            "  游戏中：揭晓汤底 | 换汤 | 退出海龟汤\n\n"
+            "  游戏中：猜汤底 <猜测> | 揭晓汤底 | 换汤 | 退出海龟汤\n\n"
             "🎒 背包\n"
             "  我的格子 | 使用记录\n\n"
             "💌 社交\n"
