@@ -4,6 +4,7 @@ from .isolation import UserIsolationManager
 from .thank_letter import ThankLetterManager
 from .shop import ShopManager
 from .games import GamesManager
+from .turtle_soup import TurtleSoupManager
 from .level import LevelManager
 from .bank import BankManager
 from .achievement import AchievementManager
@@ -17,6 +18,7 @@ __all__ = [
     "ThankLetterManager",
     "ShopManager",
     "GamesManager",
+    "TurtleSoupManager",
     "LevelManager",
     "BankManager",
     "AchievementManager",

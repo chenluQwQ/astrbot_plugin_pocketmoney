@@ -3,13 +3,24 @@ import os
 import json
 import random
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api import logger, AstrBotConfig
+
+try:
+    import astrbot.api.message_components as Comp
+    from astrbot.core.utils.session_waiter import (
+        session_waiter,
+        SessionFilter,
+        SessionController,
+    )
+    HAS_SESSION_WAITER = True
+except ImportError:
+    HAS_SESSION_WAITER = False
 
 try:
     from astrbot.api import llm_tool
@@ -29,6 +40,7 @@ from .managers import (
     ThankLetterManager,
     ShopManager,
     GamesManager,
+    TurtleSoupManager,
     LevelManager,
     BankManager,
     AchievementManager,
@@ -91,6 +103,7 @@ class PocketMoneyPlugin(Star):
         self.bank_manager = BankManager(self.data_dir)
         self.achievement_manager = AchievementManager(self.data_dir)
         self.gift_manager = GiftManager(self.data_dir)
+        self.turtle_soup_manager = TurtleSoupManager(self.data_dir)
 
         # 赠送系统配置
         self._gift_bot_name = cfg("gift_bot_name", "")
@@ -315,6 +328,12 @@ class PocketMoneyPlugin(Star):
         req.system_prompt += f"\n{pocketmoney_prompt}"
         req.system_prompt += f"\n{backpack_prompt}"
 
+        # 海龟汤裁判上下文注入
+        soup_session_key = TurtleSoupManager.get_session_key(event)
+        active_soup = self.turtle_soup_manager.get_active_soup(soup_session_key)
+        if active_soup:
+            req.system_prompt += TurtleSoupManager.build_judge_system_prompt(active_soup)
+
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
         """处理LLM响应中的标记"""
@@ -398,7 +417,7 @@ class PocketMoneyPlugin(Star):
                 if nm:
                     item_name = next((g.strip() for g in nm.groups() if g), None)
                     if item_name:
-                        if backpack_mgr.use_shared_item(item_name):
+                        if backpack_mgr.use_shared_item(item_name, current_user_id):
                             if not is_isolated:
                                 self.isolation_manager.sync_use_to_shared(item_name, self.backpack_manager)
 
@@ -741,6 +760,11 @@ class PocketMoneyPlugin(Star):
             yield event.plain_result(f"已从用户 {user_id} 的专属格子移除：{item_name}")
         else:
             yield event.plain_result(f"用户 {user_id} 的专属格子中没有找到：{item_name}")
+
+    @filter.command("使用记录")
+    async def usage_log(self, event: AstrMessageEvent):
+        """查看物品使用记录"""
+        yield event.plain_result(self.backpack_manager.format_usage_log())
 
     # ===============================================================
     #  笔记命令（管理员）
@@ -1307,6 +1331,562 @@ class PocketMoneyPlugin(Star):
         )
 
     # ===============================================================
+    #  海龟汤
+    # ===============================================================
+
+    @filter.command("海龟汤")
+    async def start_turtle_soup(self, event: AstrMessageEvent, arg: str = ""):
+        """开始海龟汤游戏"""
+        session_key = TurtleSoupManager.get_session_key(event)
+
+        # 已有活跃汤
+        if self.turtle_soup_manager.has_active_soup(session_key):
+            yield event.plain_result(
+                "🐢 已有海龟汤进行中~\n"
+                "发送「揭晓汤底」结束当前题目，或「换汤」换一道"
+            ); return
+
+        arg = arg.strip()
+        puzzle = None
+
+        # 指定编号
+        if arg.isdigit():
+            pid = int(arg)
+            puzzle = self.turtle_soup_manager.get_puzzle(pid)
+            if not puzzle:
+                yield event.plain_result(f"#{pid} 还没有内容哦，用「海龟汤列表」查看可用题目~"); return
+        else:
+            puzzle = self.turtle_soup_manager.get_random_puzzle()
+
+        # 库里没有 → 尝试在线搜索（配了 key 即自动启用）
+        if not puzzle:
+            online_ok = self._soup_search_configured()
+            if online_ok:
+                puzzle = await self._generate_soup_online(event)
+            if not puzzle:
+                msg = "题库是空的"
+                if not online_ok:
+                    msg += "，配置搜索 API Key 即可自动联网找题"
+                else:
+                    msg += "，在线搜索也失败了，请稍后再试"
+                yield event.plain_result(f"🐢 {msg}"); return
+
+        # 缓存活跃汤 → add_context_prompt 会自动注入裁判上下文
+        self.turtle_soup_manager.set_active_soup(
+            session_key, puzzle, event.get_sender_id()
+        )
+        self.turtle_soup_manager.record_play()
+        title = puzzle.get("title") or "海龟汤"
+        pid_display = f"#{puzzle['id']}" if isinstance(puzzle.get("id"), int) else puzzle.get("id", "")
+
+        yield event.plain_result(
+            f"🐢 海龟汤开始！—— {title} {pid_display}\n\n"
+            f"📜 汤面：\n{puzzle['surface']}\n\n"
+            f"直接发消息提问，我只回答「是/不是/不相关」\n"
+            f"💡 揭晓汤底 | 换汤 | 退出海龟汤"
+        )
+
+    @filter.command("揭晓汤底")
+    async def reveal_soup(self, event: AstrMessageEvent):
+        """揭晓当前海龟汤答案"""
+        session_key = TurtleSoupManager.get_session_key(event)
+        puzzle = self.turtle_soup_manager.clear_active_soup(session_key)
+        if not puzzle:
+            yield event.plain_result("🐢 当前没有进行中的海龟汤~"); return
+        self.turtle_soup_manager.record_reveal()
+        yield event.plain_result(f"🐢 汤底揭晓：\n\n{puzzle['answer']}")
+
+    @filter.command("换汤")
+    async def swap_soup(self, event: AstrMessageEvent):
+        """换一道海龟汤"""
+        session_key = TurtleSoupManager.get_session_key(event)
+        current = self.turtle_soup_manager.get_active_soup(session_key)
+        if not current:
+            yield event.plain_result("🐢 当前没有进行中的海龟汤，发「海龟汤」开始一局~"); return
+
+        new_puzzle = self.turtle_soup_manager.get_random_puzzle(
+            exclude_id=current.get("id")
+        )
+        if not new_puzzle and self._soup_search_configured():
+            new_puzzle = await self._generate_soup_online(event)
+        if not new_puzzle:
+            yield event.plain_result("🐢 没有更多汤了~"); return
+
+        # 更新缓存
+        self.turtle_soup_manager.set_active_soup(
+            session_key, new_puzzle, event.get_sender_id()
+        )
+        self.turtle_soup_manager.record_play()
+        title = new_puzzle.get("title") or "海龟汤"
+        pid_display = f"#{new_puzzle['id']}" if isinstance(new_puzzle.get("id"), int) else new_puzzle.get("id", "")
+
+        yield event.plain_result(
+            f"🐢 换汤！—— {title} {pid_display}\n\n"
+            f"📜 新汤面：\n{new_puzzle['surface']}\n\n"
+            f"继续提问吧~"
+        )
+
+    @filter.command("退出海龟汤")
+    async def quit_soup(self, event: AstrMessageEvent):
+        """退出海龟汤（不揭晓答案）"""
+        session_key = TurtleSoupManager.get_session_key(event)
+        puzzle = self.turtle_soup_manager.clear_active_soup(session_key)
+        if not puzzle:
+            yield event.plain_result("🐢 当前没有进行中的海龟汤~"); return
+        yield event.plain_result("🐢 海龟汤结束，下次再玩~")
+
+    # 内置搜索 API 地址
+    _SOUP_SEARCH_URLS = {
+        "tavily": "https://api.tavily.com/search",
+        "bocha": "https://api.bochaai.com/v1/web-search",
+        "openai": "https://api.openai.com/v1/chat/completions",
+        "grok": "https://api.x.ai/v1/chat/completions",
+    }
+
+    def _soup_search_configured(self) -> bool:
+        """检查联网搜索是否已配置（填了 type + key 即视为启用，兼容老配置）"""
+        search_type = self._cfg("soup_search_type", "")
+        search_key = self._cfg("soup_search_key", "")
+        if search_type and search_key:
+            return True
+        # 向后兼容：老配置只有 url + key，没有 type
+        search_url = self._cfg("soup_search_url", "")
+        if search_url and search_key and not search_type:
+            return True
+        return False
+
+    async def _generate_soup_online(self, event: AstrMessageEvent) -> Optional[dict]:
+        """通过搜索 API 联网查找海龟汤（带10天去重缓存）"""
+        search_type = self._cfg("soup_search_type", "").strip().lower()
+        search_key = self._cfg("soup_search_key", "")
+        custom_url = self._cfg("soup_search_url", "").strip()
+
+        if not search_key:
+            logger.warning("[TurtleSoup] 未配置 soup_search_key")
+            return None
+
+        # 向后兼容：老配置只有 url 没有 type → 从 URL 自动推断
+        if not search_type and custom_url:
+            url_lower = custom_url.lower()
+            if "tavily" in url_lower:
+                search_type = "tavily"
+            elif "bocha" in url_lower:
+                search_type = "bocha"
+            elif any(k in url_lower for k in ("openai", "x.ai", "grok")):
+                search_type = "grok" if "x.ai" in url_lower or "grok" in url_lower else "openai"
+            else:
+                search_type = "tavily"  # 默认尝试 tavily 格式
+            logger.info(f"[TurtleSoup] 从 URL 自动推断搜索类型: {search_type}")
+
+        if not search_type:
+            logger.warning("[TurtleSoup] 未配置 soup_search_type")
+            return None
+
+        search_url = custom_url or self._SOUP_SEARCH_URLS.get(search_type, "")
+        if not search_url:
+            logger.warning(f"[TurtleSoup] 不支持的搜索类型: {search_type}")
+            return None
+
+        try:
+            import aiohttp
+        except ImportError:
+            logger.error("[TurtleSoup] 需要 aiohttp 库"); return None
+
+        puzzle = None
+        try:
+            if search_type == "tavily":
+                raw_text = await self._search_tavily(search_url, search_key)
+                if raw_text:
+                    puzzle = await self._parse_search_results(event, raw_text)
+
+            elif search_type == "bocha":
+                raw_text = await self._search_bocha(search_url, search_key)
+                if raw_text:
+                    puzzle = await self._parse_search_results(event, raw_text)
+
+            elif search_type in ("openai", "grok"):
+                puzzle = await self._search_chat_api(search_url, search_key, search_type)
+
+            else:
+                raw_text = await self._search_tavily(search_url, search_key)
+                if not raw_text:
+                    raw_text = await self._search_bocha(search_url, search_key)
+                if raw_text:
+                    puzzle = await self._parse_search_results(event, raw_text)
+
+        except Exception as e:
+            logger.warning(f"[TurtleSoup] 在线搜索失败: {e}")
+
+        if puzzle:
+            # 去重：10天内出过的同一道题不再出
+            if self.turtle_soup_manager.is_duplicate_online(puzzle):
+                logger.info(f"[TurtleSoup] 在线题目重复（10天内已出过），跳过: {puzzle.get('title')}")
+                return None
+            # 缓存 + 分配编号
+            self.turtle_soup_manager.cache_online_puzzle(puzzle)
+            puzzle["id"] = self.turtle_soup_manager.next_online_id()
+            logger.info(f"[TurtleSoup] 在线搜索成功: {puzzle['id']} {puzzle.get('title')}")
+        return puzzle
+
+    async def _search_tavily(self, url: str, key: str) -> Optional[str]:
+        """Tavily Search API"""
+        import aiohttp
+        body = {
+            "api_key": key,
+            "query": "海龟汤 情境猜谜 横向思维 汤面 汤底 题目",
+            "max_results": 5,
+            "search_depth": "advanced",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                data = await resp.json()
+        results = data.get("results", [])
+        if not results:
+            return None
+        return "\n\n".join(
+            f"标题: {r.get('title', '')}\n内容: {r.get('content', '')}"
+            for r in results[:5]
+        )
+
+    async def _search_bocha(self, url: str, key: str) -> Optional[str]:
+        """Bocha (博查) Search API"""
+        import aiohttp
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        body = {"query": "海龟汤 情境猜谜 横向思维 汤面 汤底", "count": 5, "summary": True}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                data = await resp.json()
+        pages = data.get("data", {}).get("webPages", {}).get("value", [])
+        if not pages:
+            return None
+        return "\n\n".join(
+            f"标题: {p.get('name', '')}\n内容: {p.get('snippet', '')}"
+            for p in pages[:5]
+        )
+
+    async def _search_chat_api(self, url: str, key: str, search_type: str) -> Optional[dict]:
+        """OpenAI / Grok(xAI) 兼容的 Chat API（自带联网）"""
+        import aiohttp
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        prompt = TurtleSoupManager.build_search_prompt()
+
+        # 自动选 model
+        if search_type == "grok":
+            model = "grok-3"
+        else:
+            model = "gpt-4o-search-preview"
+
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1000,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                data = await resp.json()
+
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return self._parse_puzzle_json(text)
+
+    async def _parse_search_results(self, event: AstrMessageEvent, raw_text: str) -> Optional[dict]:
+        """将搜索原始结果交给当前 LLM 提取成固定格式 puzzle"""
+        try:
+            umo = event.unified_msg_origin
+            prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if not prov_id:
+                logger.warning("[TurtleSoup] 无法获取 chat_provider_id")
+                return None
+            prompt = (
+                "以下是网上搜索到的海龟汤相关内容，请从中提取一道完整的海龟汤题目。\n"
+                "如果搜索结果中有多道题，随机选一道。\n"
+                "如果没有完整题目，请基于搜索内容整理一道。\n\n"
+                f"--- 搜索结果 ---\n{raw_text[:3000]}\n--- 结束 ---\n\n"
+                "请严格按以下 JSON 格式返回，不要有任何其他内容（不要 markdown 代码块）：\n"
+                '{"title": "简短标题", "surface": "汤面内容", "answer": "汤底内容"}'
+            )
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=prov_id, prompt=prompt,
+            )
+
+            # 尝试多种方式提取 LLM 返回文本
+            resp_text = ""
+
+            # 方式1: completion_text（标准）
+            try:
+                resp_text = llm_resp.completion_text or ""
+            except Exception:
+                pass
+
+            # 方式2: 如果为空，尝试 raw_completion（某些版本）
+            if not resp_text.strip():
+                for attr in ("raw_completion", "text", "content", "message"):
+                    try:
+                        val = getattr(llm_resp, attr, None)
+                        if val and isinstance(val, str) and val.strip():
+                            resp_text = val
+                            logger.info(f"[TurtleSoup] 从 llm_resp.{attr} 获取到文本")
+                            break
+                    except Exception:
+                        pass
+
+            # 方式3: 如果还是空，尝试遍历对象属性找 JSON
+            if not resp_text.strip():
+                logger.warning(f"[TurtleSoup] completion_text 为空，尝试遍历响应对象")
+                for attr_name in dir(llm_resp):
+                    if attr_name.startswith("_"):
+                        continue
+                    try:
+                        val = getattr(llm_resp, attr_name)
+                        if isinstance(val, str) and "{" in val and "surface" in val:
+                            resp_text = val
+                            logger.info(f"[TurtleSoup] 从 llm_resp.{attr_name} 找到含 puzzle 的文本")
+                            break
+                    except Exception:
+                        pass
+
+            logger.info(f"[TurtleSoup] LLM 返回文本 (len={len(resp_text)}): {resp_text[:300] if resp_text else '(空)'}")
+
+            if not resp_text.strip():
+                # 最后手段：打印对象所有属性帮助诊断
+                attrs = {}
+                for attr_name in dir(llm_resp):
+                    if attr_name.startswith("_"):
+                        continue
+                    try:
+                        val = getattr(llm_resp, attr_name)
+                        if callable(val):
+                            continue
+                        attrs[attr_name] = str(val)[:100]
+                    except Exception:
+                        pass
+                logger.warning(f"[TurtleSoup] 响应对象属性: {json.dumps(attrs, ensure_ascii=False)[:500]}")
+                return None
+
+            return self._parse_puzzle_json(resp_text)
+        except Exception as e:
+            import traceback
+            logger.warning(f"[TurtleSoup] LLM解析搜索结果失败: {e}\n{traceback.format_exc()}")
+        return None
+
+    @staticmethod
+    def _parse_puzzle_json(text: str) -> Optional[dict]:
+        """从 LLM 返回文本中提取 puzzle JSON（兼容 thinking 模型、markdown 代码块等）"""
+        import re
+        if not text:
+            logger.warning("[TurtleSoup] _parse_puzzle_json: 空文本")
+            return None
+        text = text.strip()
+
+        # 策略1: 直接解析（纯 JSON 返回）
+        try:
+            result = json.loads(text)
+            if result.get("surface") and result.get("answer"):
+                result.setdefault("title", "在线搜索")
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # 策略2: 提取 ```json ... ``` 代码块
+        code_block = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if code_block:
+            try:
+                result = json.loads(code_block.group(1))
+                if result.get("surface") and result.get("answer"):
+                    result.setdefault("title", "在线搜索")
+                    return result
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # 策略3: 找文本中第一个 { ... } 块（贪婪匹配最后一个 }）
+        brace_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if brace_match:
+            try:
+                result = json.loads(brace_match.group(0))
+                if result.get("surface") and result.get("answer"):
+                    result.setdefault("title", "在线搜索")
+                    return result
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        logger.warning(f"[TurtleSoup] _parse_puzzle_json 解析失败，原文前200字: {text[:200]}")
+        return None
+
+    @filter.command("海龟汤搜索")
+    async def toggle_soup_online(self, event: AstrMessageEvent, toggle: str = ""):
+        """查看/开关在线搜索状态"""
+        toggle = toggle.strip()
+        if toggle in ("开", "开启", "on"):
+            self.turtle_soup_manager.set_online(True)
+            yield event.plain_result("🌐 海龟汤在线搜索已强制开启~")
+        elif toggle in ("关", "关闭", "off"):
+            self.turtle_soup_manager.set_online(False)
+            yield event.plain_result("🔒 海龟汤在线搜索已强制关闭")
+        else:
+            configured = self._soup_search_configured()
+            override = self.turtle_soup_manager.is_online_enabled()
+            search_type = self._cfg("soup_search_type", "") or "未设置"
+            if configured:
+                yield event.plain_result(
+                    f"🐢 在线搜索：✅ 已配置\n"
+                    f"搜索类型：{search_type}\n"
+                    f"配了 Key 自动启用，无需手动开关"
+                )
+            else:
+                yield event.plain_result(
+                    f"🐢 在线搜索：❌ 未配置\n"
+                    f"在插件设置中填写 soup_search_type 和 soup_search_key 即可启用\n"
+                    f"支持：tavily / bocha / openai / grok"
+                )
+
+    @filter.command("海龟汤列表")
+    async def list_soup_puzzles(self, event: AstrMessageEvent):
+        """查看题库"""
+        listing = self.turtle_soup_manager.list_puzzles()
+        # 替换在线搜索状态为实际配置状态
+        if self._soup_search_configured():
+            search_type = self._cfg("soup_search_type", "")
+            listing = listing.replace("🔒 在线搜索：关闭", f"🌐 在线搜索：已配置（{search_type}）")
+            listing = listing.replace("🌐 在线搜索：开启", f"🌐 在线搜索：已配置（{search_type}）")
+        else:
+            listing = listing.replace("🌐 在线搜索：开启", "🔒 在线搜索：未配置")
+        yield event.plain_result(listing)
+
+    @filter.command("海龟汤诊断")
+    async def diagnose_soup(self, event: AstrMessageEvent):
+        """逐步诊断海龟汤在线搜索"""
+        lines = ["🔧 海龟汤在线搜索诊断\n"]
+
+        # Step 1: 配置检查
+        search_type = self._cfg("soup_search_type", "").strip().lower()
+        search_key = self._cfg("soup_search_key", "")
+        custom_url = self._cfg("soup_search_url", "").strip()
+        lines.append(f"1️⃣ 配置")
+        lines.append(f"  search_type = '{search_type}' {'✅' if search_type else '⚠️ 未设置'}")
+        lines.append(f"  search_key = {'✅ 已填' if search_key else '❌ 未填'} ({len(search_key)}字符)")
+        lines.append(f"  custom_url = '{custom_url or '(空，用内置)'}'\n")
+
+        if not search_key:
+            lines.append("⛔ search_key 未填，无法继续")
+            yield event.plain_result("\n".join(lines)); return
+
+        # 向后兼容：从 URL 推断 type
+        if not search_type and custom_url:
+            url_lower = custom_url.lower()
+            if "tavily" in url_lower:
+                search_type = "tavily"
+            elif "bocha" in url_lower:
+                search_type = "bocha"
+            elif "x.ai" in url_lower or "grok" in url_lower:
+                search_type = "grok"
+            elif "openai" in url_lower:
+                search_type = "openai"
+            else:
+                search_type = "tavily"
+            lines.append(f"  ℹ️ 从 URL 自动推断 type = '{search_type}'")
+
+        if not search_type:
+            lines.append("⛔ search_type 未设置且无 URL 可推断")
+            yield event.plain_result("\n".join(lines)); return
+
+        search_url = custom_url or self._SOUP_SEARCH_URLS.get(search_type, "")
+        lines.append(f"  实际URL = {search_url}")
+        if not search_url:
+            lines.append("⛔ 无法确定 URL")
+            yield event.plain_result("\n".join(lines)); return
+
+        # Step 2: 搜索 API 调用
+        lines.append(f"\n2️⃣ 搜索 API ({search_type})")
+        try:
+            import aiohttp
+        except ImportError:
+            lines.append("  ❌ aiohttp 未安装")
+            yield event.plain_result("\n".join(lines)); return
+
+        raw_text = None
+        puzzle = None
+        try:
+            if search_type == "tavily":
+                raw_text = await self._search_tavily(search_url, search_key)
+            elif search_type == "bocha":
+                raw_text = await self._search_bocha(search_url, search_key)
+            elif search_type in ("openai", "grok"):
+                puzzle = await self._search_chat_api(search_url, search_key, search_type)
+            else:
+                raw_text = await self._search_tavily(search_url, search_key)
+
+            if search_type in ("openai", "grok"):
+                lines.append(f"  Chat API 返回: {'✅ 拿到puzzle' if puzzle else '❌ 解析失败'}")
+                if puzzle:
+                    lines.append(f"  title = {puzzle.get('title', '?')}")
+                    lines.append(f"  surface 前50字 = {puzzle.get('surface', '')[:50]}")
+            else:
+                lines.append(f"  搜索结果: {'✅ ' + str(len(raw_text)) + '字符' if raw_text else '❌ 空'}")
+                if raw_text:
+                    lines.append(f"  前100字: {raw_text[:100]}")
+        except Exception as e:
+            lines.append(f"  ❌ 异常: {e}")
+            yield event.plain_result("\n".join(lines)); return
+
+        # Step 3: LLM 解析（仅 tavily/bocha）
+        if raw_text and not puzzle:
+            lines.append(f"\n3️⃣ LLM 解析搜索结果")
+            try:
+                umo = event.unified_msg_origin
+                prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+                lines.append(f"  provider_id = {prov_id}")
+                if not prov_id:
+                    lines.append("  ❌ 无法获取 provider"); yield event.plain_result("\n".join(lines)); return
+
+                prompt = (
+                    "以下是网上搜索到的海龟汤相关内容，请从中提取一道完整的海龟汤题目。\n"
+                    "如果搜索结果中有多道题，随机选一道。\n"
+                    "如果没有完整题目，请基于搜索内容整理一道。\n\n"
+                    f"--- 搜索结果 ---\n{raw_text[:3000]}\n--- 结束 ---\n\n"
+                    "请严格按以下 JSON 格式返回，不要有任何其他内容（不要 markdown 代码块）：\n"
+                    '{"title": "简短标题", "surface": "汤面内容", "answer": "汤底内容"}'
+                )
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=prov_id, prompt=prompt,
+                )
+
+                # 详细检查 llm_resp 的每个属性
+                lines.append(f"  llm_resp 类型 = {type(llm_resp).__name__}")
+
+                resp_text = ""
+                for attr_name in ["completion_text", "raw_completion", "text", "content", "message"]:
+                    try:
+                        val = getattr(llm_resp, attr_name, "❌不存在")
+                        if val == "❌不存在":
+                            lines.append(f"  .{attr_name} → 不存在")
+                        elif callable(val):
+                            lines.append(f"  .{attr_name} → (方法，跳过)")
+                        elif isinstance(val, str):
+                            lines.append(f"  .{attr_name} → [{len(val)}字] {val[:80] if val else '(空)'}")
+                            if val.strip() and not resp_text:
+                                resp_text = val
+                        else:
+                            lines.append(f"  .{attr_name} → [{type(val).__name__}] {str(val)[:80]}")
+                    except Exception as ex:
+                        lines.append(f"  .{attr_name} → 访问异常: {ex}")
+
+                # 尝试解析
+                if resp_text:
+                    puzzle = self._parse_puzzle_json(resp_text)
+                    lines.append(f"\n  解析结果: {'✅ 成功' if puzzle else '❌ 失败'}")
+                    if puzzle:
+                        lines.append(f"  title = {puzzle.get('title')}")
+                else:
+                    lines.append(f"\n  ❌ 所有属性均无有效文本")
+
+            except Exception as e:
+                lines.append(f"  ❌ 异常: {e}")
+
+        # 最终结果
+        lines.append(f"\n{'✅ 诊断完成，在线搜索正常' if puzzle else '❌ 在线搜索有问题，请查看上方日志'}")
+        yield event.plain_result("\n".join(lines))
+
+    # ===============================================================
     #  帮助菜单
     # ===============================================================
 
@@ -1324,8 +1904,11 @@ class PocketMoneyPlugin(Star):
             "  老虎机 [金额] | 老虎机统计\n"
             "  猜大 <金额> | 猜小 <金额>\n"
             "  股市 | 买股票 <代码> <数量> | 卖股票 <代码> <数量> | 我的股票\n\n"
+            "🐢 海龟汤\n"
+            "  海龟汤 [编号] | 海龟汤列表 | 海龟汤搜索\n"
+            "  游戏中：揭晓汤底 | 换汤 | 退出海龟汤\n\n"
             "🎒 背包\n"
-            "  我的格子\n\n"
+            "  我的格子 | 使用记录\n\n"
             "💌 社交\n"
             "  发表扬信 | 发投诉信 <理由> | 表扬信排行\n\n"
             "📅 其他\n"
@@ -1733,7 +2316,7 @@ class PocketMoneyPlugin(Star):
         if backpack_mgr.use_user_item(user_id, item_name):
             return f"已使用「{item_name}」，从专属格子中移除了"
         # 也试试共享背包
-        if backpack_mgr.use_shared_item(item_name):
+        if backpack_mgr.use_shared_item(item_name, user_id):
             return f"已使用「{item_name}」，从共享背包中移除了"
         return f"没有找到「{item_name}」"
 

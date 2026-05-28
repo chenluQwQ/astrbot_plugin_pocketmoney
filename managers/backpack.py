@@ -48,9 +48,10 @@ class BackpackManager:
                     data["shared_items"] = data.pop("items")
                 data.setdefault("shared_items", [])
                 data.setdefault("user_slots", {})
+                data.setdefault("usage_log", [])
                 return data
         except (json.JSONDecodeError, TypeError):
-            return {"shared_items": [], "user_slots": {}}
+            return {"shared_items": [], "user_slots": {}, "usage_log": []}
 
     def _save_data(self):
         path = os.path.join(self.data_dir, "backpack.json")
@@ -102,11 +103,30 @@ class BackpackManager:
         self._save_data()
         return True
 
-    def use_shared_item(self, name: str) -> bool:
+    def _log_usage(self, item: Dict, user_id: str = None, source: str = "共享背包"):
+        """记录物品使用历史"""
+        log = self.data.setdefault("usage_log", [])
+        entry = {
+            "name": item.get("name", "未知"),
+            "description": item.get("description", ""),
+            "source": source,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if item.get("from"):
+            entry["from"] = item["from"]
+        if user_id:
+            entry["user_id"] = user_id
+        log.append(entry)
+        # 只保留最近50条
+        if len(log) > 50:
+            self.data["usage_log"] = log[-50:]
+
+    def use_shared_item(self, name: str, user_id: str = None) -> bool:
         items = self.data.get("shared_items", [])
         self._cleanup_expired(items)
         for i, item in enumerate(items):
             if _name_match(item["name"], name):
+                self._log_usage(item, user_id, "共享背包")
                 items.pop(i)
                 self._save_data()
                 return True
@@ -154,6 +174,7 @@ class BackpackManager:
         self._cleanup_expired(items)
         for i, item in enumerate(items):
             if _name_match(item["name"], name):
+                self._log_usage(item, user_id, "专属格子")
                 items.pop(i)
                 self._save_data()
                 return True
@@ -192,3 +213,29 @@ class BackpackManager:
                 s += f"[保质期至{item['expires_at'][:10]}]"
             parts.append(s)
         return "、".join(parts)
+
+    # ========== 使用记录 ==========
+
+    def get_usage_log(self, limit: int = 20) -> List[Dict]:
+        """获取最近的使用记录"""
+        log = self.data.get("usage_log", [])
+        return log[-limit:][::-1]  # 最新的在前
+
+    def format_usage_log(self, limit: int = 15) -> str:
+        """格式化使用记录"""
+        log = self.get_usage_log(limit)
+        if not log:
+            return "📋 还没有使用记录~"
+        lines = ["📋 物品使用记录：\n"]
+        for entry in log:
+            date_str = entry.get("time", "")[:10]
+            name = entry.get("name", "?")
+            from_who = entry.get("from", "")
+            desc = entry.get("description", "")
+            line = f"  {date_str}  {name}"
+            if from_who:
+                line += f"（{from_who}送的）"
+            if desc:
+                line += f" - {desc}"
+            lines.append(line)
+        return "\n".join(lines)

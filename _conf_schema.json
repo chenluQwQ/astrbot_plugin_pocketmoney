@@ -57,6 +57,24 @@
                 "type": "int",
                 "default": 5,
                 "hint": "老虎机默认每次投币金额，玩家也可自选金额"
+            },
+            "soup_search_type": {
+                "description": "海龟汤在线搜索类型",
+                "type": "string",
+                "default": "",
+                "hint": "选择搜索服务：tavily / bocha / openai / grok，留空则关闭在线搜索"
+            },
+            "soup_search_key": {
+                "description": "海龟汤搜索 API Key",
+                "type": "string",
+                "default": "",
+                "hint": "对应搜索服务的 API Key"
+            },
+            "soup_search_url": {
+                "description": "自定义 API 地址（可选）",
+                "type": "string",
+                "default": "",
+                "hint": "仅在使用中转/自建服务时需要填写，留空则自动使用官方地址"
             }
         }
     },
