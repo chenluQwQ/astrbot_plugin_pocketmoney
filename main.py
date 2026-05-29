@@ -2625,6 +2625,10 @@ class PocketMoneyPlugin(Star):
         if parsed["bot_name"] == self._gift_bot_name:
             return
 
+        # 只接收发给自己的赠送
+        if parsed.get("to_user", "").strip() != self._gift_bot_name:
+            return
+
         # 验签
         if not verify_gift(parsed["item_name"], parsed["bot_name"], parsed["timestamp"], parsed["signature"]):
             logger.debug(f"[Gift] 签名验证失败，忽略")
