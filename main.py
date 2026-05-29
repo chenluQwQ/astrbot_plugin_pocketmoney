@@ -118,7 +118,7 @@ class PocketMoneyPlugin(Star):
                 "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
                 "pm_buy_stock", "pm_sell_stock", "pm_check_balance",
                 "pm_play_scratch", "pm_give_to_user", "pm_use_user_item", "pm_gift_item",
-                "pm_play_slots",
+                "pm_play_slots", "pm_toggle_games",
             ]:
                 try:
                     self.context.activate_llm_tool(tool_name)
@@ -130,6 +130,15 @@ class PocketMoneyPlugin(Star):
         self._shop_generate_hour = cfg("shop_generate_hour", 6)
         self._shop_gen_task = None
         self._soup_judge_provider = cfg("soup_judge_provider", "")
+
+        # ---------- 游戏 LLM 节能开关 ----------
+        self._games_llm_enabled = True
+        self._GAME_LLM_TOOLS = [
+            "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
+            "pm_buy_stock", "pm_sell_stock", "pm_check_balance",
+            "pm_play_scratch", "pm_give_to_user", "pm_use_user_item",
+            "pm_gift_item", "pm_play_slots",
+        ]
 
         # ---------- 正则表达式 ----------
         self._compile_patterns()
@@ -2264,6 +2273,54 @@ class PocketMoneyPlugin(Star):
             yield event.plain_result(self._admin_denied_msg()); return
         await self._generate_ai_shop()
         yield event.plain_result("🏪 超市已刷新！\n" + self.shop_manager.format_shop_display())
+
+    # ===============================================================
+    #  游戏 LLM 节能开关
+    # ===============================================================
+
+    def _set_games_llm(self, enabled: bool):
+        """开关所有游戏 LLM 工具"""
+        self._games_llm_enabled = enabled
+        if not HAS_LLM_TOOL:
+            return
+        for tool_name in self._GAME_LLM_TOOLS:
+            try:
+                if enabled:
+                    self.context.activate_llm_tool(tool_name)
+                else:
+                    self.context.deactivate_llm_tool(tool_name)
+            except Exception:
+                pass
+
+    @filter.command("游戏节能")
+    async def games_llm_off(self, event: AstrMessageEvent):
+        """(管理员) 关闭所有游戏LLM工具，节省token"""
+        if not self._is_admin(event):
+            yield event.plain_result(self._admin_denied_msg()); return
+        self._set_games_llm(False)
+        yield event.plain_result("🔋 游戏节能模式已开启！所有游戏LLM工具已关闭，文字指令不受影响。\n发送「游戏恢复」重新开启。")
+
+    @filter.command("游戏恢复")
+    async def games_llm_on(self, event: AstrMessageEvent):
+        """(管理员) 恢复所有游戏LLM工具"""
+        if not self._is_admin(event):
+            yield event.plain_result(self._admin_denied_msg()); return
+        self._set_games_llm(True)
+        yield event.plain_result("⚡ 游戏LLM工具已全部恢复！")
+
+    @llm_tool(name="pm_toggle_games")
+    async def tool_toggle_games(self, event: AstrMessageEvent, action: str):
+        '''开启或关闭零花钱游戏系统的LLM工具。关闭后可节省token，文字指令仍可用。
+
+        Args:
+            action(string): "开启"或"关闭"
+        '''
+        if "关" in action or "off" in action.lower():
+            self._set_games_llm(False)
+            return "🔋 游戏节能模式已开启，所有游戏LLM工具已关闭。文字指令（如「签到」「逛超市」）仍可正常使用。"
+        else:
+            self._set_games_llm(True)
+            return "⚡ 游戏LLM工具已全部恢复！"
 
     # ===============================================================
     #  LLM 工具（bot自己能用的）
