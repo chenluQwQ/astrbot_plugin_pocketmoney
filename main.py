@@ -108,7 +108,7 @@ class PocketMoneyPlugin(Star):
         self.tarot_manager = TarotManager(self.data_dir)
         # 设置塔罗牌图片目录（插件根目录下的 images/tarot/）
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        tarot_images_dir = os.path.join(plugin_dir, "images", "tarot")
+        tarot_images_dir = os.path.join(plugin_dir, "tarot")
         self.tarot_manager.set_images_dir(tarot_images_dir)
 
         # 赠送系统配置
