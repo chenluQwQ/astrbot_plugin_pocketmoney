@@ -3211,16 +3211,28 @@ class PocketMoneyPlugin(Star):
 
     @filter.command("猜数字")
     async def start_guess_number(self, event: AstrMessageEvent, bet_str: str = ""):
-        """开始猜数字游戏"""
+        """开始猜数字游戏 / 游戏中直接猜"""
         self.__init_guess_sessions()
         session_key = self._bj_session_key(event).replace("bj_", "gn_")
 
+        # 如果有进行中的游戏，把参数当作猜测
         if session_key in self._guess_sessions:
             game, bet = self._guess_sessions[session_key]
             if game["status"] == "playing":
+                if bet_str.strip():
+                    try:
+                        guess_val = int(bet_str.strip())
+                        if 1 <= guess_val <= 100:
+                            # 转发到猜测逻辑
+                            async for r in self.guess_number_attempt(event, bet_str):
+                                yield r
+                            return
+                    except ValueError:
+                        pass
+                # 参数不是有效数字，显示当前状态
                 yield event.plain_result(
                     self.games_manager.format_guess_number_table(game, bet) +
-                    "\n\n🔢 直接发数字来猜吧！"
+                    "\n\n🔢 游戏进行中！直接发数字来猜，如「猜 50」或「猜数字 50」"
                 ); return
 
         if not bet_str.strip():
@@ -3243,7 +3255,7 @@ class PocketMoneyPlugin(Star):
         yield event.plain_result(
             self.games_manager.format_guess_number_table(game, bet) +
             f"\n\n🔢 猜一个1~100的数字吧！{game['max_attempts']}次机会\n"
-            "💡 直接发数字就行，如「猜 50」"
+            "💡 发「猜 50」或「猜数字 50」来猜"
         )
 
     @filter.command("猜")
