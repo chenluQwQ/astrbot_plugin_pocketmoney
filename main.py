@@ -122,10 +122,10 @@ class PocketMoneyPlugin(Star):
         if HAS_LLM_TOOL:
             for tool_name in [
                 "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
-                "pm_buy_stock", "pm_sell_stock", "pm_check_balance",
+                "pm_buy_stock", "pm_sell_stock", "pm_my_stocks", "pm_check_balance",
                 "pm_play_scratch", "pm_give_to_user", "pm_use_user_item", "pm_gift_item",
                 "pm_play_slots", "pm_toggle_games", "pm_play_blackjack",
-                "pm_tarot",
+                "pm_tarot", "pm_spin_wheel",
             ]:
                 try:
                     self.context.activate_llm_tool(tool_name)
@@ -142,10 +142,10 @@ class PocketMoneyPlugin(Star):
         self._games_llm_enabled = True
         self._GAME_LLM_TOOLS = [
             "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
-            "pm_buy_stock", "pm_sell_stock", "pm_check_balance",
+            "pm_buy_stock", "pm_sell_stock", "pm_my_stocks", "pm_check_balance",
             "pm_play_scratch", "pm_give_to_user", "pm_use_user_item",
             "pm_gift_item", "pm_play_slots", "pm_play_blackjack",
-            "pm_tarot",
+            "pm_tarot", "pm_spin_wheel",
         ]
 
         # ---------- 正则表达式 ----------
@@ -1167,8 +1167,9 @@ class PocketMoneyPlugin(Star):
     @filter.command("股市")
     async def view_stock_market(self, event: AstrMessageEvent):
         """查看今日股市行情"""
-        user_level = self.level_manager.get_level(event.get_sender_id())
-        yield event.plain_result(self.games_manager.format_stock_market(user_level))
+        user_id = event.get_sender_id()
+        user_level = self.level_manager.get_level(user_id)
+        yield event.plain_result(self.games_manager.format_stock_market(user_level, user_id=user_id))
 
     @filter.command("买股票")
     async def buy_stock(self, event: AstrMessageEvent, code: str = "", shares: str = "1"):
@@ -1184,7 +1185,7 @@ class PocketMoneyPlugin(Star):
             yield event.plain_result("数量必须是整数"); return
 
         # 先检查股票和费用
-        stocks = self.games_manager.get_stock_market()
+        stocks = self.games_manager.get_stock_market_with_holdings(user_id)
         code_upper = code.strip().upper()
         if code_upper not in stocks:
             yield event.plain_result(f"没有这支股票: {code_upper}，输入「股市」看看有哪些~"); return
@@ -1277,16 +1278,32 @@ class PocketMoneyPlugin(Star):
             winnings = round(bet, 2)
             money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
             money_mgr._save_data()
-            self.level_manager.add_xp(user_id, 5, "猜大小赢了")
+            xp_gain = max(5, int(winnings / 10))
+            self.level_manager.add_xp(user_id, xp_gain, "猜大小赢了")
+            self.achievement_manager.increment_counter(user_id, "dice_count")
+            self.achievement_manager.increment_counter(user_id, "dice_count_flag", 0)  # 标记玩过
+            if not self.achievement_manager.get_counter(user_id, "dice_count_flag"):
+                self.achievement_manager.increment_counter(user_id, "dice_count_flag", 1)
+            # 连胜追踪
+            cur_streak = self.achievement_manager.get_counter(user_id, "dice_win_streak") + 1
+            self.achievement_manager.increment_counter(user_id, "dice_win_streak", 1)
+            if cur_streak > self.achievement_manager.get_counter(user_id, "dice_streak"):
+                self.achievement_manager.data.setdefault("users", {}).setdefault(user_id, {}).setdefault("counters", {})["dice_streak"] = cur_streak
+            # 单次最大赢钱追踪
+            if winnings > self.achievement_manager.get_counter(user_id, "biggest_win"):
+                self.achievement_manager.data["users"][user_id]["counters"]["biggest_win"] = winnings
             yield event.plain_result(
                 f"🎲 {d1} + {d2} = {total}（{result}）\n"
-                f"✅ 你猜{guess}，猜对了！+{winnings}元\n"
+                f"✅ 你猜{guess}，猜对了！+{winnings}元（+{xp_gain}XP）\n"
                 f"💳 余额：{money_mgr.get_balance()}元"
             )
         else:
             money_mgr.add_expense(bet, f"猜大小：猜{guess}输了", user_id, isolation=is_isolated)
             if is_isolated:
                 self.isolation_manager.add_pending_refund(bet, "猜大小", user_id)
+            self.achievement_manager.increment_counter(user_id, "dice_count")
+            # 连胜归零
+            self.achievement_manager.data.setdefault("users", {}).setdefault(user_id, {}).setdefault("counters", {})["dice_win_streak"] = 0
             yield event.plain_result(
                 f"🎲 {d1} + {d2} = {total}（{result}）\n"
                 f"❌ 你猜{guess}，没猜对！-{bet}元\n"
@@ -2104,6 +2121,8 @@ class PocketMoneyPlugin(Star):
             "  老虎机 [金额] | 老虎机统计\n"
             "  猜大 <金额> | 猜小 <金额>\n"
             "  21点 <金额> | 要牌 | 停牌 | 加倍 | 21点统计\n"
+            "  猜数字 <金额> | 猜 <数字>\n"
+            "  转盘 <金额>\n"
             "  股市 | 买股票 <代码> <数量> | 卖股票 <代码> <数量> | 我的股票\n\n"
             "🔮 塔罗占卜\n"
             "  塔罗 单牌/三牌/六芒星 [问题]\n"
@@ -2135,6 +2154,7 @@ class PocketMoneyPlugin(Star):
 
     def _check_achievements(self, user_id: str, extra_stats: Dict = None) -> List[str]:
         """检查并解锁成就，返回新解锁的提示消息列表"""
+        # 基础状态
         stats = {
             "balance": self.manager.get_balance(),
             "level": self.level_manager.get_level(user_id),
@@ -2143,14 +2163,42 @@ class PocketMoneyPlugin(Star):
             "bank_interest": self.bank_manager._get_account(user_id).get("total_interest", 0),
             "bank_deposit_count": len(self.bank_manager._get_account(user_id).get("deposits", [])),
         }
+
+        # 游戏统计
+        scratch_stats = self.games_manager.get_scratch_stats(user_id)
+        slots_stats = self.games_manager.get_slots_stats(user_id)
+        bj_stats = self.games_manager.get_blackjack_stats(user_id)
+        tarot_stats = self.tarot_manager.get_stats(user_id)
+
+        stats["scratch_count"] = scratch_stats.get("played", 0)
+        stats["slots_count"] = slots_stats.get("played", 0)
+        stats["slots_jackpots"] = slots_stats.get("jackpots", 0)
+        stats["bj_count"] = bj_stats.get("played", 0)
+        stats["bj_wins"] = bj_stats.get("won", 0)
+        stats["bj_blackjacks"] = bj_stats.get("blackjacks", 0)
+        stats["tarot_count"] = tarot_stats.get("total", 0)
+        stats["tarot_daily_count"] = tarot_stats.get("spreads", {}).get("daily", 0)
+
+        # 身无分文检测
+        if stats["balance"] <= 0:
+            self.achievement_manager.increment_counter(user_id, "been_broke", 1)
+
+        # 统计玩过的游戏种类
+        game_types = 0
+        if scratch_stats.get("played", 0) > 0: game_types += 1
+        if slots_stats.get("played", 0) > 0: game_types += 1
+        if bj_stats.get("played", 0) > 0: game_types += 1
+        if tarot_stats.get("total", 0) > 0: game_types += 1
+        stats["games_played_types"] = game_types + self.achievement_manager.get_counter(user_id, "dice_count_flag")
+
         if extra_stats:
             stats.update(extra_stats)
 
         newly = self.achievement_manager.check_and_unlock(user_id, **stats)
         msgs = []
-        for name, desc in newly:
-            self.level_manager.add_xp(user_id, self.achievement_manager.UNLOCK_XP_REWARD, f"成就: {name}")
-            msgs.append(f"🏆 成就解锁：{name} - {desc}（+{self.achievement_manager.UNLOCK_XP_REWARD}XP）")
+        for name, desc, xp_reward in newly:
+            self.level_manager.add_xp(user_id, xp_reward, f"成就: {name}")
+            msgs.append(f"🏆 成就解锁：{name} - {desc}（+{xp_reward}XP）")
         return msgs
 
     @filter.command("签到")
@@ -2410,7 +2458,7 @@ class PocketMoneyPlugin(Star):
         Args:
         '''
         user_level = self.level_manager.get_level(event.get_sender_id())
-        return self.games_manager.format_stock_market(user_level)
+        return self.games_manager.format_stock_market(user_level, user_id=event.get_sender_id())
 
     @llm_tool(name="pm_buy_stock")
     async def tool_buy_stock(self, event: AstrMessageEvent, code: str, shares: str):
@@ -2427,7 +2475,7 @@ class PocketMoneyPlugin(Star):
         except ValueError:
             return "数量必须是整数"
 
-        stocks = self.games_manager.get_stock_market()
+        stocks = self.games_manager.get_stock_market_with_holdings(user_id)
         code_upper = code.upper()
         if code_upper not in stocks:
             return f"没有这支股票: {code_upper}"
@@ -2466,6 +2514,14 @@ class PocketMoneyPlugin(Star):
             money_mgr.data["balance"] = round(money_mgr.get_balance() + income, 2)
             money_mgr._save_data()
         return f"{msg}，余额{money_mgr.get_balance()}元"
+
+    @llm_tool(name="pm_my_stocks")
+    async def tool_my_stocks(self, event: AstrMessageEvent):
+        '''查看用户当前持有的股票持仓情况。
+
+        Args:
+        '''
+        return self.games_manager.format_user_portfolio(event.get_sender_id())
 
     @llm_tool(name="pm_check_balance")
     async def tool_check_balance(self, event: AstrMessageEvent):
@@ -3144,6 +3200,194 @@ class PocketMoneyPlugin(Star):
                 lines.append(f"  - {uid}（{items_count}件物品）")
             lines.append("\n💡 管理员始终有格子权限")
             yield event.plain_result("\n".join(lines))
+
+    # ===============================================================
+    #  小游戏：猜数字
+    # ===============================================================
+
+    def __init_guess_sessions(self):
+        if not hasattr(self, '_guess_sessions'):
+            self._guess_sessions = {}
+
+    @filter.command("猜数字")
+    async def start_guess_number(self, event: AstrMessageEvent, bet_str: str = ""):
+        """开始猜数字游戏"""
+        self.__init_guess_sessions()
+        session_key = self._bj_session_key(event).replace("bj_", "gn_")
+
+        if session_key in self._guess_sessions:
+            game, bet = self._guess_sessions[session_key]
+            if game["status"] == "playing":
+                yield event.plain_result(
+                    self.games_manager.format_guess_number_table(game, bet) +
+                    "\n\n🔢 直接发数字来猜吧！"
+                ); return
+
+        if not bet_str.strip():
+            yield event.plain_result("请下注金额，例如：猜数字 10"); return
+        ok, bet = self._parse_amount(bet_str)
+        if not ok:
+            yield event.plain_result(f"错误：{bet}"); return
+
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        if bet > money_mgr.get_balance():
+            yield event.plain_result(f"余额不足！当前 {money_mgr.get_balance()}元"); return
+
+        money_mgr.add_expense(bet, "猜数字", user_id, isolation=is_isolated)
+
+        game = self.games_manager.start_guess_number(user_id)
+        self._guess_sessions[session_key] = (game, bet)
+
+        yield event.plain_result(
+            self.games_manager.format_guess_number_table(game, bet) +
+            f"\n\n🔢 猜一个1~100的数字吧！{game['max_attempts']}次机会\n"
+            "💡 直接发数字就行，如「猜 50」"
+        )
+
+    @filter.command("猜")
+    async def guess_number_attempt(self, event: AstrMessageEvent, num_str: str = ""):
+        """猜数字 - 提交猜测"""
+        self.__init_guess_sessions()
+        session_key = self._bj_session_key(event).replace("bj_", "gn_")
+
+        if session_key not in self._guess_sessions:
+            yield event.plain_result("🔢 没有进行中的猜数字游戏，发「猜数字 <金额>」开始~"); return
+
+        game, bet = self._guess_sessions[session_key]
+        if game["status"] != "playing":
+            del self._guess_sessions[session_key]
+            yield event.plain_result("🔢 游戏已结束，发「猜数字 <金额>」开新局"); return
+
+        try:
+            guess = int(num_str.strip())
+        except ValueError:
+            yield event.plain_result("请输入一个数字，如「猜 50」"); return
+
+        if guess < 1 or guess > 100:
+            yield event.plain_result("范围是 1~100 哦~"); return
+
+        user_id = event.get_sender_id()
+        money_mgr, _, _ = self._get_managers_for_user(user_id)
+
+        game = self.games_manager.guess_number(game, guess)
+
+        if game["status"] == "won":
+            reward = self.games_manager.guess_number_reward(game["attempts"], bet)
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + reward, 2)
+            money_mgr._save_data()
+            xp = max(10, int(reward / 5))
+            self.level_manager.add_xp(user_id, xp, "猜数字赢了")
+            del self._guess_sessions[session_key]
+            yield event.plain_result(
+                self.games_manager.format_guess_number_table(game, bet) +
+                f"\n\n💳 余额：{money_mgr.get_balance()}元（+{xp}XP）"
+            )
+            self._check_achievements(user_id, {"biggest_win": reward})
+        elif game["status"] == "lost":
+            del self._guess_sessions[session_key]
+            yield event.plain_result(
+                self.games_manager.format_guess_number_table(game, bet) +
+                f"\n\n💸 -${bet}元\n💳 余额：{money_mgr.get_balance()}元"
+            )
+            self._check_achievements(user_id)
+        else:
+            # 继续猜
+            remaining = game["max_attempts"] - game["attempts"]
+            yield event.plain_result(
+                self.games_manager.format_guess_number_table(game, bet) +
+                f"\n\n还有 {remaining} 次机会！继续猜~"
+            )
+
+    # ===============================================================
+    #  小游戏：幸运转盘
+    # ===============================================================
+
+    @filter.command("转盘")
+    async def spin_wheel(self, event: AstrMessageEvent, bet_str: str = ""):
+        """幸运转盘"""
+        if not bet_str.strip():
+            yield event.plain_result(
+                "🎡 幸运转盘\n"
+                "  💎 钻石 x5 | ⭐ 星星 x3 | 🎁 礼物 x2\n"
+                "  🍀 幸运 x1.5 | 🔔 回本 x1 | 💨 半价 x0.5\n"
+                "  ❌ 落空 x0 | 🌀 免费再转！\n\n"
+                "💡 用法：转盘 <金额>"
+            ); return
+
+        ok, bet = self._parse_amount(bet_str)
+        if not ok:
+            yield event.plain_result(f"错误：{bet}"); return
+
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        if bet > money_mgr.get_balance():
+            yield event.plain_result(f"余额不足！当前 {money_mgr.get_balance()}元"); return
+
+        money_mgr.add_expense(bet, "幸运转盘", user_id, isolation=is_isolated)
+
+        emoji, name, winnings, free_spin = self.games_manager.spin_wheel(user_id, bet)
+
+        if free_spin:
+            # 退回赌注
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + bet, 2)
+            money_mgr._save_data()
+            result = self.games_manager.format_wheel_result(
+                emoji, name, winnings, bet, money_mgr.get_balance(), free_spin=True
+            )
+            yield event.plain_result(result + f"\n\n🌀 再发一次「转盘 {bet}」免费转！")
+            # 标记免费转（简化：直接退回钱了）
+        else:
+            if winnings > 0:
+                money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
+                money_mgr._save_data()
+                if winnings > bet:
+                    xp = max(5, int(winnings / 10))
+                    self.level_manager.add_xp(user_id, xp, "转盘赢了")
+
+            result = self.games_manager.format_wheel_result(
+                emoji, name, winnings, bet, money_mgr.get_balance()
+            )
+            yield event.plain_result(result)
+
+        self._check_achievements(user_id, {"biggest_win": winnings})
+
+    @llm_tool(name="pm_spin_wheel")
+    async def tool_spin_wheel(self, event: AstrMessageEvent, bet: str):
+        '''幸运转盘，返回转盘面板请原样输出。
+
+        Args:
+            bet(string): 下注金额
+        '''
+        ok, bet_val = self._parse_amount(bet)
+        if not ok:
+            return f"错误：{bet_val}"
+
+        user_id = event.get_sender_id()
+        money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
+
+        if bet_val > money_mgr.get_balance():
+            return f"余额不足！当前 {money_mgr.get_balance()}元"
+
+        money_mgr.add_expense(bet_val, "幸运转盘", user_id, isolation=is_isolated)
+        emoji, name, winnings, free_spin = self.games_manager.spin_wheel(user_id, bet_val)
+
+        if free_spin:
+            money_mgr.data["balance"] = round(money_mgr.get_balance() + bet_val, 2)
+            money_mgr._save_data()
+            panel = self.games_manager.format_wheel_result(
+                emoji, name, winnings, bet_val, money_mgr.get_balance(), free_spin=True
+            )
+        else:
+            if winnings > 0:
+                money_mgr.data["balance"] = round(money_mgr.get_balance() + winnings, 2)
+                money_mgr._save_data()
+            panel = self.games_manager.format_wheel_result(
+                emoji, name, winnings, bet_val, money_mgr.get_balance()
+            )
+        return f"请将以下转盘面板原样发送给用户，不要改写，可以在后面加一句评论：\n\n{panel}"
 
     # ===============================================================
     #  小游戏：21点 (Blackjack)

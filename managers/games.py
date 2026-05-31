@@ -226,8 +226,40 @@ class GamesManager:
         }
 
     def get_stock_market(self) -> Dict[str, Dict]:
-        """获取全部股市行情"""
+        """获取全部股市行情（含每日随机 + 用户持有的固定上市）"""
         self._refresh_stocks_if_needed()
+        return dict(self.data.get("stocks", {}))
+
+    def get_stock_market_with_holdings(self, user_id: str = None) -> Dict[str, Dict]:
+        """获取行情：每日随机股 + 用户持有的股（持有股不占随机名额）"""
+        self._refresh_stocks_if_needed()
+        stocks = dict(self.data.get("stocks", {}))
+
+        if user_id:
+            portfolio = self.data.get("user_portfolios", {}).get(user_id, {})
+            for code, holding in portfolio.items():
+                if holding.get("shares", 0) > 0 and code not in stocks:
+                    # 从 STOCK_LIST 找到这只股票，用昨日收盘价（均价）作为参考
+                    for s in self.STOCK_LIST:
+                        if s["code"] == code:
+                            avg_cost = holding["total_cost"] / holding["shares"]
+                            # 生成一个基于均价的浮动价格
+                            import random as _rnd
+                            change_pct = _rnd.uniform(-0.15, 0.20)
+                            today_price = max(1, round(avg_cost * (1 + change_pct), 1))
+                            stocks[code] = {
+                                "name": s["name"],
+                                "price": today_price,
+                                "yesterday": round(avg_cost, 1),
+                                "change_pct": round(change_pct * 100, 1),
+                                "min_level": s.get("min_level", 0),
+                                "_held": True,  # 标记为持有上市
+                            }
+                            # 同时写入 stocks 数据，这样卖出时能找到价格
+                            self.data["stocks"][code] = stocks[code]
+                            self._save_data()
+                            break
+        return stocks
         return self.data.get("stocks", {})
 
     def buy_stock(self, user_id: str, code: str, shares: int) -> Tuple[bool, str, float]:
@@ -265,17 +297,20 @@ class GamesManager:
         """
         self._refresh_stocks_if_needed()
         code = code.upper()
-        stocks = self.data.get("stocks", {})
 
-        if code not in stocks:
-            return False, f"没有这支股票: {code}", 0
-
+        # 先检查用户是否持有
         portfolios = self.data.get("user_portfolios", {})
         user_portfolio = portfolios.get(user_id, {})
         holding = user_portfolio.get(code)
 
         if not holding or holding.get("shares", 0) <= 0:
             return False, f"你没有持有 {code}", 0
+
+        # 确保持有的股票在市场中（自动上市）
+        stocks = self.get_stock_market_with_holdings(user_id)
+
+        if code not in stocks:
+            return False, f"找不到 {code} 的市场数据", 0
 
         if shares <= 0 or shares > holding["shares"]:
             return False, f"你只持有 {holding['shares']}股 {code}", 0
@@ -306,23 +341,38 @@ class GamesManager:
         result = {}
         for code, holding in portfolio.items():
             if holding.get("shares", 0) > 0:
-                current_price = stocks.get(code, {}).get("price", 0)
                 avg_cost = holding["total_cost"] / holding["shares"] if holding["shares"] > 0 else 0
+                if code in stocks:
+                    # 今日在市
+                    current_price = stocks[code]["price"]
+                    name = stocks[code].get("name", code)
+                    suspended = False
+                else:
+                    # 今日停牌：用均价作为参考价
+                    current_price = round(avg_cost, 2)
+                    # 从 STOCK_LIST 找名字
+                    name = code
+                    for s in self.STOCK_LIST:
+                        if s["code"] == code:
+                            name = s["name"]
+                            break
+                    suspended = True
                 market_value = round(current_price * holding["shares"], 2)
                 profit = round(market_value - holding["total_cost"], 2)
                 result[code] = {
-                    "name": stocks.get(code, {}).get("name", code),
+                    "name": name,
                     "shares": holding["shares"],
                     "avg_cost": round(avg_cost, 2),
                     "current_price": current_price,
                     "market_value": market_value,
                     "profit": profit,
+                    "suspended": suspended,
                 }
         return result
 
-    def format_stock_market(self, user_level: int = 0) -> str:
-        """格式化股市行情显示（按等级过滤）"""
-        all_stocks = self.get_stock_market()
+    def format_stock_market(self, user_level: int = 0, user_id: str = None) -> str:
+        """格式化股市行情显示（按等级过滤，含持有股）"""
+        all_stocks = self.get_stock_market_with_holdings(user_id) if user_id else self.get_stock_market()
         if not all_stocks:
             return "📈 股市暂未开盘"
 
@@ -339,9 +389,10 @@ class GamesManager:
                 arrow = "🟢↓"
             else:
                 arrow = "⚪️→"
+            held_tag = " 📌持有" if info.get("_held") else ""
             lines.append(
                 f"  {arrow} {info['name']}({code}): {info['price']}元"
-                f" ({'+' if change >= 0 else ''}{change}%)"
+                f" ({'+' if change >= 0 else ''}{change}%){held_tag}"
             )
 
         lines.append(f"\n💡 买入：买股票 <代码> <数量>")
@@ -359,15 +410,22 @@ class GamesManager:
         total_value = 0
         total_profit = 0
         for code, info in portfolio.items():
-            profit_str = f"+{info['profit']}" if info['profit'] >= 0 else str(info['profit'])
-            emoji = "🔴" if info['profit'] >= 0 else "🟢"
-            lines.append(
-                f"  {emoji} {info['name']}({code}): {info['shares']}股"
-                f" | 均价{info['avg_cost']}元 | 现价{info['current_price']}元"
-                f" | 市值{info['market_value']}元 | 盈亏{profit_str}元"
-            )
-            total_value += info['market_value']
-            total_profit += info['profit']
+            if info.get("suspended"):
+                lines.append(
+                    f"  📛 {info['name']}({code}): {info['shares']}股"
+                    f" | 均价{info['avg_cost']}元 | 今日停牌"
+                )
+                total_value += info['market_value']
+            else:
+                profit_str = f"+{info['profit']}" if info['profit'] >= 0 else str(info['profit'])
+                emoji = "🔴" if info['profit'] >= 0 else "🟢"
+                lines.append(
+                    f"  {emoji} {info['name']}({code}): {info['shares']}股"
+                    f" | 均价{info['avg_cost']}元 | 现价{info['current_price']}元"
+                    f" | 市值{info['market_value']}元 | 盈亏{profit_str}元"
+                )
+                total_value += info['market_value']
+                total_profit += info['profit']
 
         total_profit_str = f"+{total_profit}" if total_profit >= 0 else str(total_profit)
         lines.append(f"\n💰 总市值：{round(total_value, 2)}元 | 总盈亏：{total_profit_str}元")
@@ -726,4 +784,176 @@ class GamesManager:
         return self.data.get("blackjack_stats", {}).get(
             user_id, {"played": 0, "won": 0, "lost": 0, "push": 0,
                        "total_bet": 0, "total_net": 0, "blackjacks": 0}
+        )
+
+    # ============================================================
+    #  猜数字
+    # ============================================================
+
+    def start_guess_number(self, user_id: str) -> Dict:
+        """开始猜数字游戏"""
+        target = random.randint(1, 100)
+        game = {
+            "user_id": user_id,
+            "target": target,
+            "attempts": 0,
+            "max_attempts": 8,
+            "history": [],
+            "status": "playing",  # playing / won / lost
+        }
+        return game
+
+    def guess_number(self, game: Dict, guess: int) -> Dict:
+        """猜一个数字"""
+        if game["status"] != "playing":
+            return game
+
+        game["attempts"] += 1
+        target = game["target"]
+
+        if guess == target:
+            game["status"] = "won"
+            game["history"].append((guess, "🎯"))
+        elif guess < target:
+            game["history"].append((guess, "⬆️ 大了"))
+            if game["attempts"] >= game["max_attempts"]:
+                game["status"] = "lost"
+        else:
+            game["history"].append((guess, "⬇️ 小了"))
+            if game["attempts"] >= game["max_attempts"]:
+                game["status"] = "lost"
+
+        return game
+
+    def guess_number_reward(self, attempts: int, bet: float) -> float:
+        """根据猜对的次数计算奖金倍率"""
+        # 越少次数奖励越高
+        multipliers = {
+            1: 10.0,   # 一次蒙中
+            2: 5.0,
+            3: 3.0,
+            4: 2.0,
+            5: 1.5,
+            6: 1.2,
+            7: 1.0,    # 回本
+            8: 0.8,    # 勉强
+        }
+        multi = multipliers.get(attempts, 0.5)
+        return round(bet * multi, 2)
+
+    def format_guess_number_table(self, game: Dict, bet: float = 0) -> str:
+        """格式化猜数字游戏面板"""
+        lines = [
+            "┌──────────────────────┐",
+            "│    🔢  猜 数 字      │",
+            "├──────────────────────┤",
+            f"│ 范围：1 ~ 100",
+            f"│ 次数：{game['attempts']}/{game['max_attempts']}",
+        ]
+
+        if game["history"]:
+            lines.append("│ 记录：")
+            for num, hint in game["history"]:
+                lines.append(f"│   {num} → {hint}")
+
+        if game["status"] == "won":
+            reward = self.guess_number_reward(game["attempts"], bet)
+            lines.append(f"├──────────────────────┤")
+            lines.append(f"│ 🎉 猜对了！用了{game['attempts']}次")
+            lines.append(f"│ 💰 奖金：{reward}元")
+        elif game["status"] == "lost":
+            lines.append(f"├──────────────────────┤")
+            lines.append(f"│ 😢 次数用完了")
+            lines.append(f"│ 答案是 {game['target']}")
+
+        lines.append("└──────────────────────┘")
+        return "\n".join(lines)
+
+    # ============================================================
+    #  幸运转盘
+    # ============================================================
+
+    WHEEL_SECTORS = [
+        ("💎", "钻石", 5.0, 2),     # (emoji, 名称, 倍率, 权重)
+        ("⭐", "星星", 3.0, 5),
+        ("🎁", "礼物", 2.0, 10),
+        ("🍀", "幸运", 1.5, 15),
+        ("🔔", "铃铛", 1.0, 20),     # 回本
+        ("💨", "微风", 0.5, 25),
+        ("❌", "落空", 0.0, 20),
+        ("🌀", "再转一次", -1, 3),  # 特殊：免费再转
+    ]
+
+    def spin_wheel(self, user_id: str, bet: float) -> Tuple[str, str, float, bool]:
+        """
+        转一次幸运转盘
+        :return: (emoji, 名称, 实际奖金, 是否免费再转)
+        """
+        pool = []
+        for emoji, name, multi, weight in self.WHEEL_SECTORS:
+            pool.extend([(emoji, name, multi)] * weight)
+        chosen = random.choice(pool)
+        emoji, name, multi = chosen
+
+        free_spin = multi == -1
+        if free_spin:
+            winnings = 0.0
+        else:
+            winnings = round(bet * multi, 2)
+
+        # 记录统计
+        stats = self.data.setdefault("wheel_stats", {})
+        user_stats = stats.setdefault(user_id, {"played": 0, "spent": 0, "won": 0})
+        user_stats["played"] += 1
+        user_stats["spent"] = round(user_stats["spent"] + bet, 2)
+        user_stats["won"] = round(user_stats["won"] + winnings, 2)
+        self._save_data()
+
+        return emoji, name, winnings, free_spin
+
+    def format_wheel_result(self, emoji: str, name: str, winnings: float,
+                             bet: float, balance: float, free_spin: bool = False) -> str:
+        """格式化幸运转盘结果"""
+        # 生成转盘视觉
+        sectors = ["💎", "⭐", "🎁", "🍀", "🔔", "💨", "❌", "🌀"]
+        random.shuffle(sectors)
+        # 把中奖的放中间
+        if emoji in sectors:
+            sectors.remove(emoji)
+        sectors.insert(4, emoji)  # 中间位置
+
+        wheel_line = " ".join(sectors[:3])
+        wheel_line2 = f"  ▶ {emoji} ◀  "
+        wheel_line3 = " ".join(sectors[5:8])
+
+        net = round(winnings - bet, 2)
+        if free_spin:
+            result_text = f"│ 🌀 {name}！免费再转一次！"
+            cost_text = f"│ 💰 赌注退回"
+        elif winnings > 0:
+            net_str = f"+{net}" if net >= 0 else str(net)
+            result_text = f"│ {emoji} {name}！x{winnings/bet:.1f}倍"
+            cost_text = f"│ 💰 奖金：{winnings}元（净{net_str}元）"
+        else:
+            result_text = f"│ {emoji} {name}..."
+            cost_text = f"│ 💸 花费 {bet}元"
+
+        return (
+            f"┌─────────────────┐\n"
+            f"│   🎡 幸运转盘   │\n"
+            f"├─────────────────┤\n"
+            f"│  {wheel_line}\n"
+            f"│ {wheel_line2}\n"
+            f"│  {wheel_line3}\n"
+            f"├─────────────────┤\n"
+            f"{result_text}\n"
+            f"{cost_text}\n"
+            f"│ 💳 余额：{balance}元\n"
+            f"└─────────────────┘"
+        )
+
+    def get_wheel_stats(self, user_id: str) -> Dict:
+        """获取用户转盘统计"""
+        return self.data.get("wheel_stats", {}).get(
+            user_id, {"played": 0, "spent": 0, "won": 0}
         )
