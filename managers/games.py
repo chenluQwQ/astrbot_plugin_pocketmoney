@@ -815,11 +815,11 @@ class GamesManager:
             game["status"] = "won"
             game["history"].append((guess, "🎯"))
         elif guess < target:
-            game["history"].append((guess, "⬆️ 大了"))
+            game["history"].append((guess, "⬆️ 小了"))
             if game["attempts"] >= game["max_attempts"]:
                 game["status"] = "lost"
         else:
-            game["history"].append((guess, "⬇️ 小了"))
+            game["history"].append((guess, "⬇️ 大了"))
             if game["attempts"] >= game["max_attempts"]:
                 game["status"] = "lost"
 
