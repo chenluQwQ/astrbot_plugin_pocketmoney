@@ -1047,7 +1047,7 @@ class PocketMoneyPlugin(Star):
     @filter.command("逛超市")
     async def view_shop(self, event: AstrMessageEvent):
         """查看今日超市商品"""
-        yield event.plain_result(self.shop_manager.format_shop_display())
+        yield event.plain_result(self.shop_manager.format_shop_display(event.get_sender_id()))
 
     @filter.command("购买")
     async def buy_from_shop(self, event: AstrMessageEvent, item_input: str = ""):
@@ -1082,6 +1082,8 @@ class PocketMoneyPlugin(Star):
         purchased = self.shop_manager.buy_item(shop_item["id"], user_id)
         if not purchased:
             yield event.plain_result("购买失败，可能已售罄"); return
+        if isinstance(purchased, dict) and purchased.get("error") == "already_owned":
+            yield event.plain_result(f"你已经拥有「{purchased['name']}」了，收藏品只能买一个哦~"); return
 
         money_mgr.add_expense(price, f"超市购买：{purchased['name']}", user_id, isolation=is_isolated)
         if is_isolated:
@@ -2338,7 +2340,7 @@ class PocketMoneyPlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result(self._admin_denied_msg()); return
         await self._generate_ai_shop()
-        yield event.plain_result("🏪 超市已刷新！\n" + self.shop_manager.format_shop_display())
+        yield event.plain_result("🏪 超市已刷新！\n" + self.shop_manager.format_shop_display(event.get_sender_id()))
 
     # ===============================================================
     #  游戏 LLM 节能开关
@@ -2418,11 +2420,11 @@ class PocketMoneyPlugin(Star):
 
         Args:
         '''
-        return self.shop_manager.format_shop_display()
+        return self.shop_manager.format_shop_display(event.get_sender_id())
 
     @llm_tool(name="pm_buy_item")
     async def tool_buy_item(self, event: AstrMessageEvent, item_name: str):
-        '''买超市商品，入共享背包。
+        '''买超市或今日食品店的商品，入共享背包。
 
         Args:
             item_name(string): 商品名称
@@ -2432,7 +2434,7 @@ class PocketMoneyPlugin(Star):
 
         shop_item = self.shop_manager.find_item_by_name(item_name)
         if not shop_item:
-            return f"超市里没有「{item_name}」"
+            return f"超市和食品店里都没有「{item_name}」"
 
         price = shop_item["price"]
         if price > money_mgr.get_balance():
@@ -2441,11 +2443,18 @@ class PocketMoneyPlugin(Star):
         if backpack_mgr.is_shared_full():
             return "共享背包满了，需要先用掉或送出一些东西腾出空位"
 
-        purchased = self.shop_manager.buy_item(shop_item["id"], user_id)
+        # 食品店商品走单独的购买流程
+        if shop_item.get("_food_shop"):
+            purchased = self.shop_manager.buy_food_shop_item(shop_item["name"], user_id)
+        else:
+            purchased = self.shop_manager.buy_item(shop_item["id"], user_id)
+
         if not purchased:
             return "已售罄"
+        if isinstance(purchased, dict) and purchased.get("error") == "already_owned":
+            return f"你已经拥有「{purchased['name']}」了，收藏品只能买一个~"
 
-        money_mgr.add_expense(price, f"超市购买：{purchased['name']}", user_id, isolation=is_isolated)
+        money_mgr.add_expense(price, f"购买：{purchased['name']}", user_id, isolation=is_isolated)
         backpack_mgr.add_shared_item(purchased["name"], purchased["desc"], expires_at=purchased.get("expires_at"))
         self.achievement_manager.increment_counter(user_id, "purchase_count")
 
@@ -3112,11 +3121,11 @@ class PocketMoneyPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @llm_tool(name="pm_tarot")
-    async def tool_tarot(self, event: AstrMessageEvent, spread_type: str, question: str = ""):
-        '''塔罗占卜。返回牌面面板请原样输出，不要改写。
+    async def tool_tarot(self, event: AstrMessageEvent, spread_type: str = "三牌", question: str = ""):
+        '''塔罗占卜。默认抽三张牌（时间之流牌阵）。返回牌面面板请原样输出，不要改写。
 
         Args:
-            spread_type(string): 牌阵类型："单牌"、"三牌"、"六芒星"、"日运"
+            spread_type(string): 牌阵类型：默认"三牌"。可选"单牌"(1张2元)、"三牌"(3张5元)、"六芒星"(6张10元)、"日运"(免费每天一次)
             question(string): 提问者的问题（可选）
         '''
         user_id = event.get_sender_id()
@@ -3133,9 +3142,11 @@ class PocketMoneyPlugin(Star):
 
         # 解析牌阵
         spread_map = {
-            "单牌": "single", "单": "single",
-            "三牌": "three", "三": "three", "时间之流": "three",
-            "六芒星": "hexagram", "六": "hexagram",
+            "单牌": "single", "单": "single", "1": "single", "one": "single",
+            "三牌": "three", "三": "three", "3": "three", "three": "three",
+            "时间之流": "three", "过去现在未来": "three",
+            "六芒星": "hexagram", "六": "hexagram", "6": "hexagram", "hex": "hexagram",
+            "塔罗": "three", "占卜": "three",  # 通用词默认三牌
         }
         st = spread_map.get(spread_type.strip(), "three")
         spread = self.tarot_manager.SPREADS[st]
