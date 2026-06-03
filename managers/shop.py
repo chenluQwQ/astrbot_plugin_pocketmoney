@@ -168,7 +168,8 @@ class ShopManager:
     线上超市系统
     - 每日10个商品（普通9-10 + 2%概率出收藏品替换其中一个）
     - 节日当天自动加入手写节日商品（替换普通商品）
-    - AI生成仅负责普通商品，收藏品/节日商品由固定池控制
+    - 收藏品唯一：每人只能买一个，买过的不再出现
+    - 主题食品店：每日随机开一家（蛋糕店/烤肉店/快餐店等）
     """
 
     def __init__(self, data_dir: str, daily_item_count: int = 10, item_pool: Dict = None):
@@ -196,6 +197,104 @@ class ShopManager:
         path = os.path.join(self.data_dir, "shop.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    # ========== 收藏品唯一性 ==========
+
+    def get_owned_collectibles(self, user_id: str) -> List[str]:
+        """获取用户已拥有的收藏品名称列表"""
+        return self.data.get("owned_collectibles", {}).get(user_id, [])
+
+    def _record_collectible(self, user_id: str, item_name: str):
+        """记录用户购买收藏品"""
+        owned = self.data.setdefault("owned_collectibles", {})
+        user_list = owned.setdefault(user_id, [])
+        if item_name not in user_list:
+            user_list.append(item_name)
+            self._save_data()
+
+    def has_collectible(self, user_id: str, item_name: str) -> bool:
+        """检查用户是否已拥有某收藏品"""
+        return item_name in self.get_owned_collectibles(user_id)
+
+    # ========== 主题食品店 ==========
+
+    FOOD_SHOPS = {
+        "cake": {
+            "name": "🎂 甜心蛋糕店",
+            "items": [
+                {"name": "🍰 草莓蛋糕", "category": "food", "price": 6, "desc": "铺满草莓的奶油蛋糕", "shelf_life_days": 2},
+                {"name": "🧁 杯子蛋糕", "category": "food", "price": 3, "desc": "巧克力霜淇淋杯子蛋糕", "shelf_life_days": 3},
+                {"name": "🍩 甜甜圈", "category": "food", "price": 2, "desc": "糖霜甜甜圈", "shelf_life_days": 2},
+                {"name": "🥐 可颂", "category": "food", "price": 3, "desc": "黄油可颂，外酥里嫩", "shelf_life_days": 1},
+                {"name": "🍮 焦糖布丁", "category": "food", "price": 4, "desc": "表面焦脆的经典布丁", "shelf_life_days": 2},
+                {"name": "🧇 华夫饼", "category": "food", "price": 3, "desc": "淋蜂蜜的格子华夫", "shelf_life_days": 1},
+            ],
+        },
+        "bbq": {
+            "name": "🥩 炭火烤肉店",
+            "items": [
+                {"name": "🥩 和牛五花", "category": "food", "price": 8, "desc": "A5和牛雪花五花肉", "shelf_life_days": 1},
+                {"name": "🍖 猪排", "category": "food", "price": 4, "desc": "秘制酱烤猪排", "shelf_life_days": 1},
+                {"name": "🍗 烤鸡翅", "category": "food", "price": 3, "desc": "蜜汁烤鸡翅", "shelf_life_days": 1},
+                {"name": "🌽 烤玉米", "category": "food", "price": 2, "desc": "刷酱烤玉米", "shelf_life_days": 1},
+                {"name": "🫑 烤青椒", "category": "food", "price": 1, "desc": "微辣的烤青椒", "shelf_life_days": 1},
+                {"name": "🍢 烤串拼盘", "category": "food", "price": 5, "desc": "羊肉串+牛肉串+鸡心", "shelf_life_days": 1},
+            ],
+        },
+        "fastfood": {
+            "name": "🍔 快乐快餐店",
+            "items": [
+                {"name": "🍔 经典汉堡", "category": "food", "price": 4, "desc": "双层牛肉芝士汉堡", "shelf_life_days": 1},
+                {"name": "🍟 薯条", "category": "food", "price": 2, "desc": "大份脆薯条", "shelf_life_days": 1},
+                {"name": "🌮 墨西哥卷", "category": "food", "price": 3, "desc": "鸡肉牛油果卷", "shelf_life_days": 1},
+                {"name": "🌭 热狗", "category": "food", "price": 2, "desc": "美式芥末热狗", "shelf_life_days": 1},
+                {"name": "🥤 可乐", "category": "food", "price": 2, "desc": "冰可乐", "shelf_life_days": 30},
+                {"name": "🍕 芝士披萨", "category": "food", "price": 5, "desc": "拉丝芝士薄底披萨", "shelf_life_days": 1},
+            ],
+        },
+        "chinese": {
+            "name": "🥢 家常菜馆",
+            "items": [
+                {"name": "🥘 红烧肉", "category": "food", "price": 6, "desc": "肥而不腻的红烧肉", "shelf_life_days": 1},
+                {"name": "🍜 兰州拉面", "category": "food", "price": 4, "desc": "一清二白三红四绿五黄", "shelf_life_days": 1},
+                {"name": "🥟 小笼包", "category": "food", "price": 3, "desc": "鲜肉小笼包一屉", "shelf_life_days": 1},
+                {"name": "🍚 蛋炒饭", "category": "food", "price": 3, "desc": "粒粒分明的蛋炒饭", "shelf_life_days": 1},
+                {"name": "🫕 麻辣烫", "category": "food", "price": 5, "desc": "自选配菜麻辣烫", "shelf_life_days": 1},
+                {"name": "🥡 宫保鸡丁", "category": "food", "price": 4, "desc": "花生米嘎嘣脆", "shelf_life_days": 1},
+            ],
+        },
+        "dessert": {
+            "name": "🍨 甜品站",
+            "items": [
+                {"name": "🍨 芒果冰沙", "category": "food", "price": 4, "desc": "新鲜芒果打的冰沙", "shelf_life_days": 1},
+                {"name": "🧋 珍珠奶茶", "category": "food", "price": 4, "desc": "波霸珍珠奶茶", "shelf_life_days": 1},
+                {"name": "🍡 团子", "category": "food", "price": 2, "desc": "三色糯米团子", "shelf_life_days": 2},
+                {"name": "🥧 苹果派", "category": "food", "price": 3, "desc": "肉桂苹果派", "shelf_life_days": 2},
+                {"name": "🍧 刨冰", "category": "food", "price": 3, "desc": "红豆抹茶刨冰", "shelf_life_days": 1},
+                {"name": "🫘 红豆汤", "category": "food", "price": 2, "desc": "温热的红豆汤", "shelf_life_days": 1},
+            ],
+        },
+        "snack": {
+            "name": "🍿 零食小铺",
+            "items": [
+                {"name": "🍿 爆米花", "category": "food", "price": 2, "desc": "焦糖味爆米花", "shelf_life_days": 7},
+                {"name": "🥜 坚果拼盘", "category": "food", "price": 4, "desc": "腰果杏仁核桃夏威夷果", "shelf_life_days": 30},
+                {"name": "🍫 巧克力棒", "category": "food", "price": 3, "desc": "夹心巧克力棒", "shelf_life_days": 90},
+                {"name": "🍘 仙贝", "category": "food", "price": 2, "desc": "旺旺大礼包同款", "shelf_life_days": 60},
+                {"name": "🥨 椒盐脆饼", "category": "food", "price": 2, "desc": "嘎嘣脆的椒盐饼", "shelf_life_days": 30},
+                {"name": "🧀 芝士条", "category": "food", "price": 3, "desc": "拉丝芝士条", "shelf_life_days": 14},
+            ],
+        },
+    }
+
+    def _get_today_food_shop(self) -> Optional[Dict]:
+        """获取今日主题食品店（每天随机一家）"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        # 用日期做种子，保证同一天同一家店
+        seed = int(today.replace("-", ""))
+        rng = random.Random(seed)
+        shop_key = rng.choice(list(self.FOOD_SHOPS.keys()))
+        return self.FOOD_SHOPS[shop_key]
 
     def needs_refresh(self) -> bool:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -280,6 +379,10 @@ class ShopManager:
             self.refresh_with_defaults()
         for item in self.data["items"]:
             if item["id"] == item_id and item.get("stock", 0) > 0:
+                # 收藏品唯一性检查
+                if item.get("category") == "collectible":
+                    if self.has_collectible(buyer_id, item["name"]):
+                        return {"error": "already_owned", "name": item["name"]}
                 item["stock"] -= 1
                 purchased = {
                     "name": item["name"],
@@ -292,6 +395,9 @@ class ShopManager:
                         datetime.now() + timedelta(days=item["shelf_life_days"])
                     ).strftime("%Y-%m-%d %H:%M:%S")
                     purchased["shelf_life_days"] = item["shelf_life_days"]
+                # 记录收藏品
+                if item["category"] == "collectible":
+                    self._record_collectible(buyer_id, item["name"])
                 self.data["purchase_log"].append({
                     "buyer": buyer_id, "item": item["name"],
                     "price": item["price"],
@@ -306,18 +412,57 @@ class ShopManager:
             self.refresh_with_defaults()
         query = name.strip().lower().replace(" ", "")
         query_no_emoji = _strip_emoji(name).lower().replace(" ", "")
+        # 先找超市
         for item in self.data["items"]:
             if item.get("stock", 0) > 0:
                 item_full = item["name"].strip().lower().replace(" ", "")
                 item_no_emoji = _strip_emoji(item["name"]).lower().replace(" ", "")
                 if query in (item_full, item_no_emoji) or query_no_emoji in (item_full, item_no_emoji):
                     return item
+        # 再找今日食品店
+        food_shop = self._get_today_food_shop()
+        if food_shop:
+            for fs_item in food_shop["items"]:
+                item_full = fs_item["name"].strip().lower().replace(" ", "")
+                item_no_emoji = _strip_emoji(fs_item["name"]).lower().replace(" ", "")
+                if query in (item_full, item_no_emoji) or query_no_emoji in (item_full, item_no_emoji):
+                    return {"_food_shop": True, **fs_item}
         return None
 
-    def format_shop_display(self) -> str:
+    def buy_food_shop_item(self, item_name: str, buyer_id: str) -> Optional[Dict]:
+        """从今日食品店购买"""
+        food_shop = self._get_today_food_shop()
+        if not food_shop:
+            return None
+        for fs_item in food_shop["items"]:
+            if _strip_emoji(fs_item["name"]).lower().replace(" ", "") == _strip_emoji(item_name).lower().replace(" ", "") \
+               or fs_item["name"].strip().lower().replace(" ", "") == item_name.strip().lower().replace(" ", ""):
+                purchased = {
+                    "name": fs_item["name"],
+                    "category": fs_item["category"],
+                    "price": fs_item["price"],
+                    "desc": fs_item["desc"],
+                }
+                if fs_item.get("shelf_life_days"):
+                    purchased["expires_at"] = (
+                        datetime.now() + timedelta(days=fs_item["shelf_life_days"])
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    purchased["shelf_life_days"] = fs_item["shelf_life_days"]
+                self.data["purchase_log"].append({
+                    "buyer": buyer_id, "item": fs_item["name"],
+                    "price": fs_item["price"],
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                self._save_data()
+                return purchased
+        return None
+
+    def format_shop_display(self, user_id: str = "") -> str:
         items = self.get_today_items()
         if not items:
             return "🏪 今日超市已售罄，明天再来吧~"
+
+        owned = self.get_owned_collectibles(user_id) if user_id else []
 
         cat_emoji = {"food": "🍱", "item": "🎪", "decoration": "✨",
                      "collectible": "🏅", "flower": "💐"}
@@ -332,6 +477,19 @@ class ShopManager:
             header += f" 🎉{holiday}"
 
         lines = [header + "\n"]
+
+        # 今日主题食品店
+        food_shop = self._get_today_food_shop()
+        if food_shop:
+            lines.append(f"╔═ {food_shop['name']} ═╗")
+            for fs_item in food_shop["items"]:
+                shelf = f" | {fs_item.get('shelf_life_days', 1)}天保质" if fs_item.get("shelf_life_days") else ""
+                lines.append(f"  🍽️ {fs_item['name']} - {fs_item['price']}元{shelf}")
+                lines.append(f"     {fs_item['desc']}")
+            lines.append(f"╚═══════════════╝\n")
+
+        # 普通超市
+        lines.append("── 便利超市 ──")
         for item in items:
             emoji = cat_emoji.get(item["category"], "📦")
             cat = cat_name.get(item["category"], "其他")
@@ -340,14 +498,20 @@ class ShopManager:
                 shelf = f" | 保质期{item['shelf_life_days']}天"
             elif item["category"] == "collectible":
                 shelf = " | ⚠️永久收藏·稀有"
-            collectible_tag = " 🌟稀有!" if item["category"] == "collectible" else ""
+
+            owned_tag = ""
+            if item["category"] == "collectible" and item["name"] in owned:
+                owned_tag = " ✅已拥有"
+
+            collectible_tag = " 🌟稀有!" if item["category"] == "collectible" and not owned_tag else ""
             lines.append(
                 f"{emoji} [{item['id']}] {item['name']} - {item['price']}元"
-                f" | {cat} | 库存{item['stock']}{shelf}{collectible_tag}"
+                f" | {cat} | 库存{item['stock']}{shelf}{collectible_tag}{owned_tag}"
             )
             lines.append(f"   📝 {item['desc']}")
 
-        lines.append(f"\n💡 购买：购买 <编号>")
+        lines.append(f"\n💡 购买超市商品：购买 <编号>")
+        lines.append(f"💡 购买食品店：购买 <食品名>")
         return "\n".join(lines)
 
     @staticmethod
