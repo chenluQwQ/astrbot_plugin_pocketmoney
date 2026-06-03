@@ -121,7 +121,7 @@ class PocketMoneyPlugin(Star):
         # ---------- LLM 工具注册 ----------
         if HAS_LLM_TOOL:
             for tool_name in [
-                "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
+                "pm_sign_in", "pm_view_shop", "pm_browse_shop", "pm_buy_item", "pm_view_stocks",
                 "pm_buy_stock", "pm_sell_stock", "pm_my_stocks", "pm_check_balance",
                 "pm_play_scratch", "pm_give_to_user", "pm_use_user_item", "pm_gift_item",
                 "pm_play_slots", "pm_toggle_games", "pm_play_blackjack",
@@ -141,7 +141,7 @@ class PocketMoneyPlugin(Star):
         # ---------- 游戏 LLM 节能开关 ----------
         self._games_llm_enabled = True
         self._GAME_LLM_TOOLS = [
-            "pm_sign_in", "pm_view_shop", "pm_buy_item", "pm_view_stocks",
+            "pm_sign_in", "pm_view_shop", "pm_browse_shop", "pm_buy_item", "pm_view_stocks",
             "pm_buy_stock", "pm_sell_stock", "pm_my_stocks", "pm_check_balance",
             "pm_play_scratch", "pm_give_to_user", "pm_use_user_item",
             "pm_gift_item", "pm_play_slots", "pm_play_blackjack",
@@ -1046,40 +1046,87 @@ class PocketMoneyPlugin(Star):
 
     @filter.command("逛超市")
     async def view_shop(self, event: AstrMessageEvent):
-        """查看今日超市商品"""
-        yield event.plain_result(self.shop_manager.format_shop_display(event.get_sender_id()))
+        """查看购物街"""
+        yield event.plain_result(self.shop_manager.format_shop_list())
+
+    @filter.command("购物")
+    async def view_shops_alt(self, event: AstrMessageEvent):
+        """查看购物街"""
+        yield event.plain_result(self.shop_manager.format_shop_list())
+
+    @filter.command("逛")
+    async def browse_specific_shop(self, event: AstrMessageEvent, shop_name: str = ""):
+        """浏览指定店铺"""
+        shop_name = shop_name.strip()
+        if not shop_name:
+            yield event.plain_result(self.shop_manager.format_shop_list()); return
+
+        user_id = event.get_sender_id()
+        result = self.shop_manager.browse_shop(shop_name, user_id)
+        if result:
+            yield event.plain_result(result); return
+
+        # 没有这家店 → 尝试AI生成
+        yield event.plain_result(f"🏬 {shop_name}还没开张，bot帮你现场开一家...")
+        try:
+            umo = event.unified_msg_origin
+            prov_id = self._shop_provider_name or await self.context.get_current_chat_provider_id(umo=umo)
+            if prov_id:
+                prompt = ShopManager.build_ai_shop_prompt(shop_name)
+                llm_resp = await self.context.llm_generate(chat_provider_id=prov_id, prompt=prompt)
+                resp_text = (llm_resp.completion_text or "").strip()
+                resp_text = resp_text.strip("`").strip()
+                if resp_text.startswith("json"):
+                    resp_text = resp_text[4:].strip()
+                import json as _json
+                shop_data = _json.loads(resp_text)
+                if isinstance(shop_data, dict) and "items" in shop_data:
+                    self.shop_manager.save_ai_shop(shop_name, shop_data)
+                    browse_result = self.shop_manager.browse_shop(shop_name, user_id)
+                    if browse_result:
+                        yield event.plain_result(f"✨ {shop_name}新鲜开张！\n\n" + browse_result); return
+        except Exception as e:
+            logger.debug(f"[Shop] AI生成店铺失败: {e}")
+        yield event.plain_result(f"😅 {shop_name}开张失败了，换个店逛逛吧~")
 
     @filter.command("购买")
-    async def buy_from_shop(self, event: AstrMessageEvent, item_input: str = ""):
-        """从超市购买商品"""
+    async def buy_from_shop_cmd(self, event: AstrMessageEvent, item_input: str = ""):
+        """购买商品（编号或商品名，跨所有店铺搜索）"""
         if not item_input.strip():
-            yield event.plain_result("请指定商品编号，例如：购买 1"); return
-
-        item_input = item_input.strip()
-        if not item_input.isdigit():
-            yield event.plain_result("请输入商品编号（数字），输入「逛超市」查看编号"); return
+            yield event.plain_result("请指定商品，如「购买 1」（便利超市编号）或「购买 草莓蛋糕」"); return
 
         user_id = event.get_sender_id()
         money_mgr, backpack_mgr, is_isolated = self._get_managers_for_user(user_id)
 
-        item_id = int(item_input)
-        shop_item = None
-        for si in self.shop_manager.get_today_items():
-            if si["id"] == item_id:
-                shop_item = si
-                break
+        item_input = item_input.strip()
 
-        if not shop_item:
-            yield event.plain_result(f"没有编号 {item_id} 的商品，输入「逛超市」看看今天有啥~"); return
+        # 按编号买（便利超市）
+        if item_input.isdigit():
+            item_id = int(item_input)
+            shop_item = None
+            for si in self.shop_manager.get_today_items():
+                if si["id"] == item_id:
+                    shop_item = si
+                    break
+            if not shop_item:
+                yield event.plain_result(f"便利超市没有编号 {item_id} 的商品"); return
+            buy_name = shop_item["name"]
+            price = shop_item["price"]
+        else:
+            # 按名称跨店搜索
+            result = self.shop_manager.find_item_across_shops(item_input)
+            if not result:
+                yield event.plain_result(f"所有店铺都没有「{item_input}」~"); return
+            found_item, shop_name = result
+            buy_name = found_item["name"]
+            price = found_item["price"]
 
-        price = shop_item["price"]
         if price > money_mgr.get_balance():
-            yield event.plain_result(f"余额不足！{shop_item['name']} 需要 {price}元，当前余额 {money_mgr.get_balance()}元"); return
-
+            yield event.plain_result(f"余额不足！需要 {price}元，当前余额 {money_mgr.get_balance()}元"); return
         if backpack_mgr.is_shared_full():
             yield event.plain_result("共享背包满了，先用掉一些东西吧~"); return
 
-        purchased = self.shop_manager.buy_item(shop_item["id"], user_id)
+        purchased = self.shop_manager.buy_from_shop(buy_name, user_id)
         if not purchased:
             yield event.plain_result("购买失败，可能已售罄"); return
         if isinstance(purchased, dict) and purchased.get("error") == "already_owned":
@@ -2117,7 +2164,7 @@ class PocketMoneyPlugin(Star):
             "💰 经济\n"
             "  签到 | 等级 | 成就 | 银行 | 存银行 <金额> | 取银行 <编号>\n\n"
             "🏪 超市\n"
-            "  逛超市 | 购买 <编号>\n\n"
+            "  购物 | 逛超市 | 逛 <店名> | 购买 <编号/商品名>\n\n"
             "🎮 小游戏\n"
             "  刮刮乐 | 刮刮乐统计\n"
             "  老虎机 [金额] | 老虎机统计\n"
@@ -2416,15 +2463,48 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_view_shop")
     async def tool_view_shop(self, event: AstrMessageEvent):
-        '''查看今日超市商品。
+        '''查看购物街所有店铺列表。
 
         Args:
         '''
-        return self.shop_manager.format_shop_display(event.get_sender_id())
+        return self.shop_manager.format_shop_list()
+
+    @llm_tool(name="pm_browse_shop")
+    async def tool_browse_shop(self, event: AstrMessageEvent, shop_name: str):
+        '''浏览指定店铺的商品。如果店铺不存在会自动AI生成一家。
+
+        Args:
+            shop_name(string): 店铺名称，如"蛋糕店"、"烤肉店"、"寿司店"等
+        '''
+        user_id = event.get_sender_id()
+        result = self.shop_manager.browse_shop(shop_name, user_id)
+        if result:
+            return result
+
+        # AI生成店铺
+        try:
+            umo = event.unified_msg_origin
+            prov_id = self._shop_provider_name or await self.context.get_current_chat_provider_id(umo=umo)
+            if prov_id:
+                prompt = ShopManager.build_ai_shop_prompt(shop_name)
+                llm_resp = await self.context.llm_generate(chat_provider_id=prov_id, prompt=prompt)
+                resp_text = (llm_resp.completion_text or "").strip().strip("`").strip()
+                if resp_text.startswith("json"):
+                    resp_text = resp_text[4:].strip()
+                import json as _json
+                shop_data = _json.loads(resp_text)
+                if isinstance(shop_data, dict) and "items" in shop_data:
+                    self.shop_manager.save_ai_shop(shop_name, shop_data)
+                    browse_result = self.shop_manager.browse_shop(shop_name, user_id)
+                    if browse_result:
+                        return f"✨ {shop_name}新鲜开张！\n\n" + browse_result
+        except Exception as e:
+            logger.debug(f"[Shop] AI生成店铺失败: {e}")
+        return f"暂时开不了{shop_name}，换一家试试？"
 
     @llm_tool(name="pm_buy_item")
     async def tool_buy_item(self, event: AstrMessageEvent, item_name: str):
-        '''买超市或今日食品店的商品，入共享背包。
+        '''购买商品（自动跨所有店铺搜索）。
 
         Args:
             item_name(string): 商品名称
@@ -2434,21 +2514,16 @@ class PocketMoneyPlugin(Star):
 
         shop_item = self.shop_manager.find_item_by_name(item_name)
         if not shop_item:
-            return f"超市和食品店里都没有「{item_name}」"
+            return f"所有店铺都没有「{item_name}」"
 
         price = shop_item["price"]
         if price > money_mgr.get_balance():
-            return f"余额不足！{shop_item['name']}需要{price}元，余额{money_mgr.get_balance()}元"
+            return f"余额不足！需要{price}元，余额{money_mgr.get_balance()}元"
 
         if backpack_mgr.is_shared_full():
             return "共享背包满了，需要先用掉或送出一些东西腾出空位"
 
-        # 食品店商品走单独的购买流程
-        if shop_item.get("_food_shop"):
-            purchased = self.shop_manager.buy_food_shop_item(shop_item["name"], user_id)
-        else:
-            purchased = self.shop_manager.buy_item(shop_item["id"], user_id)
-
+        purchased = self.shop_manager.buy_from_shop(shop_item["name"], user_id)
         if not purchased:
             return "已售罄"
         if isinstance(purchased, dict) and purchased.get("error") == "already_owned":
