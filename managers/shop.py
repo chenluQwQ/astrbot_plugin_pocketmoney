@@ -435,7 +435,7 @@ class ShopManager:
             lines.append(f"  {s['emoji']} {s['name']}  {s['desc']}")
         lines.append(f"\n💡 逛店铺：逛 <店名>")
         lines.append(f"💡 直接买：购买 <商品名>")
-        lines.append(f"💡 想逛别的店？直接说，没有的会现开一家")
+        lines.append(f"💡 没有想买的？和bot说说，找找其他的")
         return "\n".join(lines)
 
     # ========== 便利超市 ==========
@@ -501,6 +501,12 @@ class ShopManager:
 
     # ========== 浏览店铺 ==========
 
+    @staticmethod
+    def _normalize_shop_name(name: str) -> str:
+        """模糊匹配店名：去掉末尾的店/馆/铺/屋/坊/堂/厅/房/摊"""
+        import re
+        return re.sub(r'[店馆铺屋坊堂厅房摊]$', '', name.strip())
+
     def browse_shop(self, shop_name: str, user_id: str = "") -> Optional[str]:
         owned = self.get_owned_collectibles(user_id) if user_id else []
 
@@ -521,23 +527,18 @@ class ShopManager:
             lines.append(f"\n💡 购买 <编号> 或 购买 <商品名>")
             return "\n".join(lines)
 
-        # 今日开放的主题店
-        today_shops = self._get_today_shops()
-        for sn in today_shops:
-            if shop_name in (sn, _strip_emoji(sn)):
-                info = THEMED_SHOPS[sn]
-                return self._format_themed_shop(sn, info)
-
-        # 不在今日列表但在总池子里 → 也可以逛
+        # 模糊匹配：今日开放的主题店 → 全部主题店
+        norm = self._normalize_shop_name(shop_name)
         for sn, info in THEMED_SHOPS.items():
-            if shop_name in (sn, _strip_emoji(sn)):
+            if shop_name in (sn, _strip_emoji(sn)) or norm == self._normalize_shop_name(sn):
                 return self._format_themed_shop(sn, info)
 
         # AI 店铺缓存
         today = datetime.now().strftime("%Y-%m-%d")
         ai_shops = self.data.get("ai_shops", {}).get(today, {})
-        if shop_name in ai_shops:
-            return self._format_themed_shop(shop_name, ai_shops[shop_name])
+        for ai_name, info in ai_shops.items():
+            if shop_name in (ai_name, _strip_emoji(ai_name)) or norm == self._normalize_shop_name(ai_name):
+                return self._format_themed_shop(ai_name, info)
 
         return None
 
