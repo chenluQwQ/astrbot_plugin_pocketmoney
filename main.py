@@ -53,7 +53,7 @@ from .managers import (
 @register("astrbot_plugin_pocketmoney", "晨露", "小金库系统 - 零花钱、超市、小游戏、背包", "2.0.0")
 class PocketMoneyPlugin(Star):
     """
-    v2.1.0 - 模块化重构 + 去硬编码 + 超市系统 + 小游戏（刮刮乐/炒股）
+    v2.0.0 - 模块化重构 + 去硬编码 + 超市系统 + 小游戏（刮刮乐/炒股）
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1046,8 +1046,8 @@ class PocketMoneyPlugin(Star):
 
     @filter.command("逛超市")
     async def view_shop(self, event: AstrMessageEvent):
-        """查看购物街"""
-        yield event.plain_result(self.shop_manager.format_shop_list())
+        """查看便利超市"""
+        yield event.plain_result(self.shop_manager.browse_shop("便利超市", event.get_sender_id()))
 
     @filter.command("购物")
     async def view_shops_alt(self, event: AstrMessageEvent):
@@ -1066,16 +1066,15 @@ class PocketMoneyPlugin(Star):
         if result:
             yield event.plain_result(result); return
 
-        # 没有这家店 → 尝试AI生成
-        yield event.plain_result(f"🏬 {shop_name}还没开张，bot帮你现场开一家...")
+        # 没有这家店 → AI生成
+        yield event.plain_result(f"🏬 {shop_name}正在筹备开业...")
         try:
             umo = event.unified_msg_origin
             prov_id = self._shop_provider_name or await self.context.get_current_chat_provider_id(umo=umo)
             if prov_id:
                 prompt = ShopManager.build_ai_shop_prompt(shop_name)
                 llm_resp = await self.context.llm_generate(chat_provider_id=prov_id, prompt=prompt)
-                resp_text = (llm_resp.completion_text or "").strip()
-                resp_text = resp_text.strip("`").strip()
+                resp_text = (llm_resp.completion_text or "").strip().strip("`").strip()
                 if resp_text.startswith("json"):
                     resp_text = resp_text[4:].strip()
                 import json as _json
@@ -1084,10 +1083,10 @@ class PocketMoneyPlugin(Star):
                     self.shop_manager.save_ai_shop(shop_name, shop_data)
                     browse_result = self.shop_manager.browse_shop(shop_name, user_id)
                     if browse_result:
-                        yield event.plain_result(f"✨ {shop_name}新鲜开张！\n\n" + browse_result); return
+                        yield event.plain_result(f"✨ {shop_name}开张啦！\n\n" + browse_result); return
         except Exception as e:
             logger.debug(f"[Shop] AI生成店铺失败: {e}")
-        yield event.plain_result(f"😅 {shop_name}开张失败了，换个店逛逛吧~")
+        yield event.plain_result(f"😅 {shop_name}暂时开不了，换一家逛逛？")
 
     @filter.command("购买")
     async def buy_from_shop_cmd(self, event: AstrMessageEvent, item_input: str = ""):
@@ -2163,7 +2162,7 @@ class PocketMoneyPlugin(Star):
             "📖 零花钱系统 - 指令大全\n\n"
             "💰 经济\n"
             "  签到 | 等级 | 成就 | 银行 | 存银行 <金额> | 取银行 <编号>\n\n"
-            "🏪 超市\n"
+            "🏪 购物\n"
             "  购物 | 逛超市 | 逛 <店名> | 购买 <编号/商品名>\n\n"
             "🎮 小游戏\n"
             "  刮刮乐 | 刮刮乐统计\n"
@@ -2471,7 +2470,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_browse_shop")
     async def tool_browse_shop(self, event: AstrMessageEvent, shop_name: str):
-        '''浏览指定店铺的商品。如果店铺不存在会自动AI生成一家。
+        '''浏览指定店铺的商品。购物街有很多固定店铺（蛋糕店、烤肉店、快餐店、寿司店、奶茶店、花店等），优先逛这些店。如果用户想逛的店不存在才会AI生成。
 
         Args:
             shop_name(string): 店铺名称，如"蛋糕店"、"烤肉店"、"寿司店"等
@@ -2504,7 +2503,7 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_buy_item")
     async def tool_buy_item(self, event: AstrMessageEvent, item_name: str):
-        '''购买商品（自动跨所有店铺搜索）。
+        '''购买商品，自动搜索所有店铺（便利超市+全部主题店），直接用商品名就行。
 
         Args:
             item_name(string): 商品名称
