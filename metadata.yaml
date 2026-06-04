@@ -2,6 +2,6 @@ name: astrbot_plugin_pocketmoney
 display_name: 零花钱系统
 desc: 虚拟经济系统：零花钱/超市/小游戏/银行/等级/成就/跨bot赠送
 help: 输入「零花钱帮助」查看全部指令
-version: v2.0.0
+version: v2.1.0
 author: 晨露
 repo: https://github.com/chenluQwQ/astrbot_plugin_pocketmoney
