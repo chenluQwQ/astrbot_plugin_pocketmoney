@@ -2715,67 +2715,121 @@ class PocketMoneyPlugin(Star):
     # ===============================================================
 
     @llm_tool(name="pm_give_to_user")
-    async def tool_give_to_user(self, event: AstrMessageEvent, item_name: str):
-        '''把共享背包的物品送给当前用户。如果用户有专属格子权限则放入格子，否则直接发话送出。
+    async def tool_give_to_user(self, event: AstrMessageEvent, item_name: str, to_user: str = ""):
+        '''把背包里的物品送给群里的某个人。用户说"送个蛋糕给小明"就用这个。送完后请用人设描写递礼物的互动场景，不要输出任何格式化标签。
+        如果to_user为空，则送给当前说话的用户自己（相当于使用物品）。
 
         Args:
             item_name(string): 物品名称
+            to_user(string): 收礼人的名字，留空则送给说话的人自己
         '''
         user_id = event.get_sender_id()
         user_name = event.get_sender_name() or user_id
+        _, backpack_mgr, _ = self._get_managers_for_user(user_id)
 
-        # 从共享背包查找
-        shared = self.backpack_manager.get_shared_items()
+        # 共享背包 + 用户格子都找
         found = None
-        for item in shared:
+        source = None
+        for item in backpack_mgr.get_shared_items():
             if _name_match(item["name"], item_name):
                 found = item
+                source = "shared"
                 break
+        if not found:
+            for item in backpack_mgr.get_user_items(user_id):
+                if _name_match(item["name"], item_name):
+                    found = item
+                    source = "user"
+                    break
         if not found:
             return f"背包里没有「{item_name}」"
 
-        is_admin_user = self._is_admin(event)
-        desc = found.get("description", "")
-        expires = found.get("expires_at")
+        desc = found.get("description", found.get("desc", ""))
 
-        if self.backpack_manager.is_user_slots_allowed(user_id, is_admin=is_admin_user):
-            # 有格子权限 → 放入专属格子
-            if self.backpack_manager.is_user_slots_full(user_id):
-                return f"{user_name}的格子满了，放不下"
-            self.backpack_manager.use_shared_item(found["name"])
-            self.backpack_manager.add_user_gift(
-                user_id, found["name"], desc,
-                "背包赠送", expires_at=expires,
-            )
-            return f"已把「{found['name']}」送给{user_name}，放进了ta的专属格子"
+        # 取出物品
+        if source == "shared":
+            backpack_mgr.use_shared_item(found["name"])
         else:
-            # 没有格子权限 → 从共享背包取出，直接"送出"（不入格子）
-            self.backpack_manager.use_shared_item(found["name"])
-            return f"已把「{found['name']}」送给{user_name}啦~（{desc}）"
+            backpack_mgr.use_user_item(user_id, found["name"])
+
+        recipient = to_user.strip() if to_user.strip() else ""
+        is_self = (not recipient) or (recipient == user_name)
+
+        if is_self:
+            # 送给自己 = 享用物品
+            return (
+                f"「{found['name']}」已取出（{desc}）。\n"
+                f"请用你的人设，描写一段和{user_name}一起享用/使用「{found['name']}」的互动场景，1-2句话。"
+            )
+        else:
+            # 送给群里其他人 → 自然语言，不走协议
+            return (
+                f"「{found['name']}」已从背包取出送给{recipient}了。\n"
+                f"请用你的人设，描写帮{user_name}把「{found['name']}」送给{recipient}的温馨场景，1-2句话。不要输出格式化标签。"
+            )
 
     @llm_tool(name="pm_use_user_item")
     async def tool_use_user_item(self, event: AstrMessageEvent, item_name: str):
-        '''消耗/丢弃用户格子或背包里的物品。
+        '''使用/享用背包里的物品。用完物品会自动消失。使用后请用你的人设描写一段和用户一起使用这个物品的互动小场景。
 
         Args:
             item_name(string): 物品名称
         '''
         user_id = event.get_sender_id()
+        user_name = event.get_sender_name() or "用户"
         _, backpack_mgr, _ = self._get_managers_for_user(user_id)
-        if backpack_mgr.use_user_item(user_id, item_name):
-            return f"已使用「{item_name}」，从专属格子中移除了"
-        # 也试试共享背包
-        if backpack_mgr.use_shared_item(item_name, user_id):
-            return f"已使用「{item_name}」，从共享背包中移除了"
-        return f"没有找到「{item_name}」"
+
+        # 找到物品信息
+        item_info = None
+        source = None
+        for item in backpack_mgr.get_user_items(user_id):
+            if _name_match(item["name"], item_name):
+                item_info = item
+                source = "user"
+                break
+        if not item_info:
+            for item in backpack_mgr.get_shared_items():
+                if _name_match(item["name"], item_name):
+                    item_info = item
+                    source = "shared"
+                    break
+        if not item_info:
+            return f"背包里没有「{item_name}」"
+
+        # 移除物品
+        if source == "user":
+            backpack_mgr.use_user_item(user_id, item_info["name"])
+        else:
+            backpack_mgr.use_shared_item(item_info["name"], user_id)
+
+        desc = item_info.get("description", item_info.get("desc", ""))
+        category = item_info.get("category", "item")
+
+        # 根据物品类型给不同的互动引导
+        if category == "food":
+            return (
+                f"「{item_info['name']}」已取出（{desc}）。\n"
+                f"请用你的人设，描写一段和{user_name}一起吃「{item_info['name']}」的互动场景，"
+                f"1-2句话，要有画面感和互动感，可以描写味道、表情、小动作。"
+            )
+        elif category == "flower":
+            return (
+                f"「{item_info['name']}」已取出（{desc}）。\n"
+                f"请用你的人设，描写{user_name}收到/欣赏「{item_info['name']}」的温馨场景，1-2句话。"
+            )
+        else:
+            return (
+                f"「{item_info['name']}」已取出（{desc}）。\n"
+                f"请用你的人设，描写和{user_name}一起使用「{item_info['name']}」的互动场景，1-2句话，轻松有趣。"
+            )
 
     @llm_tool(name="pm_gift_item")
     async def tool_gift_item(self, event: AstrMessageEvent, item_names: str, to_user: str):
-        '''跨bot赠送物品，支持一次赠送多个。多个物品用逗号分隔。
+        '''跨bot赠送（只有送给【其他bot】时才用，送给群里的人用pm_give_to_user）。对方bot会自动接收。
 
         Args:
-            item_names(string): 物品名称，多个用逗号/顿号分隔，如 "苹果,蛋糕" 或 "苹果、蛋糕"
-            to_user(string): 对象名字
+            item_names(string): 物品名称，多个用逗号/顿号分隔
+            to_user(string): 对方bot的名字
         '''
         if not self._gift_bot_name:
             return "赠送功能未配置bot名称（gift_bot_name）"
@@ -2847,9 +2901,13 @@ class PocketMoneyPlugin(Star):
 
         result_parts = []
         if sent_names:
-            result_parts.append(f"已发出赠送{'、'.join(f'「{n}」' for n in sent_names)}给{to_user}的请求，等待对方bot接收（5分钟超时自动退回）")
+            names_str = '、'.join(f'「{n}」' for n in sent_names)
+            result_parts.append(
+                f"已把{names_str}打包好发给{to_user}了（等待对方接收，5分钟超时退回）。\n"
+                f"请用你的人设，描写帮用户准备礼物给{to_user}的场景，1-2句话。"
+            )
         if not_found:
-            result_parts.append(f"以下物品未找到：{'、'.join(not_found)}")
+            result_parts.append(f"以下物品没找到：{'、'.join(not_found)}")
         return "。".join(result_parts)
 
     @filter.regex(r"「.+?」发起赠送「.+?」给 @.+?，是否接收？\[GK:[a-f0-9]{6}:\d+\]")
