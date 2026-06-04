@@ -53,7 +53,7 @@ from .managers import (
 @register("astrbot_plugin_pocketmoney", "晨露", "小金库系统 - 零花钱、超市、小游戏、背包", "2.0.0")
 class PocketMoneyPlugin(Star):
     """
-    v2.0.0 - 模块化重构 + 去硬编码 + 超市系统 + 小游戏（刮刮乐/炒股）
+    v2.1.0 - 模块化重构 + 去硬编码 + 超市系统 + 小游戏（刮刮乐/炒股）
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
