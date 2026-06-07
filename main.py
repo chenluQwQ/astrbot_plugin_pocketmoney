@@ -2716,13 +2716,16 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_give_to_user")
     async def tool_give_to_user(self, event: AstrMessageEvent, item_name: str, to_user: str = ""):
-        '''把背包里的物品送给群里的某个人。用户说"送个蛋糕给小明"就用这个。送完后请用人设描写递礼物的互动场景，不要输出任何格式化标签。
-        如果to_user为空，则送给当前说话的用户自己（相当于使用物品）。
+        '''把背包里的物品送给群里的某个人。
+        - to_user为空 → 送给自己（享用物品）
+        - to_user有值 → 送给那个人，等ta自然语言回复"收到/好的/谢谢"就完成
+        送出后请用人设描写场景。
 
         Args:
             item_name(string): 物品名称
             to_user(string): 收礼人的名字，留空则送给说话的人自己
         '''
+        self._init_pending_gifts()
         user_id = event.get_sender_id()
         user_name = event.get_sender_name() or user_id
         _, backpack_mgr, _ = self._get_managers_for_user(user_id)
@@ -2756,16 +2759,30 @@ class PocketMoneyPlugin(Star):
         is_self = (not recipient) or (recipient == user_name)
 
         if is_self:
-            # 送给自己 = 享用物品
             return (
                 f"「{found['name']}」已取出（{desc}）。\n"
                 f"请用你的人设，描写一段和{user_name}一起享用/使用「{found['name']}」的互动场景，1-2句话。"
             )
         else:
-            # 送给群里其他人 → 自然语言，不走协议
+            # 存为待接收，等收礼人自然语言回复
+            import time
+            group_id = event.get_group_id() or f"private_{user_id}"
+            pending_key = f"ug_{group_id}"
+            self._pending_user_gifts[pending_key] = {
+                "item_name": found["name"],
+                "item_desc": desc,
+                "item_data": found,
+                "sender_id": user_id,
+                "sender_name": user_name,
+                "recipient_name": recipient,
+                "group_id": group_id,
+                "timestamp": time.time(),
+                "expires_at": found.get("expires_at"),
+            }
             return (
-                f"「{found['name']}」已从背包取出送给{recipient}了。\n"
-                f"请用你的人设，描写帮{user_name}把「{found['name']}」送给{recipient}的温馨场景，1-2句话。不要输出格式化标签。"
+                f"「{found['name']}」已从背包取出，正在递给{recipient}。\n"
+                f"请用你的人设，描写把「{found['name']}」递给{recipient}的场景，"
+                f"然后问{recipient}要不要收下，等ta回复。"
             )
 
     @llm_tool(name="pm_use_user_item")
@@ -3339,6 +3356,78 @@ class PocketMoneyPlugin(Star):
                 lines.append(f"  - {uid}（{items_count}件物品）")
             lines.append("\n💡 管理员始终有格子权限")
             yield event.plain_result("\n".join(lines))
+
+    # ===============================================================
+    #  用户间赠送 - 自然语言接收
+    # ===============================================================
+
+    def _init_pending_gifts(self):
+        if not hasattr(self, '_pending_user_gifts'):
+            self._pending_user_gifts = {}
+
+    def _cleanup_expired_gifts(self):
+        """清理过期的待接收赠送（5分钟），退回物品"""
+        import time
+        self._init_pending_gifts()
+        now = time.time()
+        expired_keys = []
+        for key, gift in self._pending_user_gifts.items():
+            if now - gift["timestamp"] > 300:
+                expired_keys.append(key)
+                _, backpack_mgr, _ = self._get_managers_for_user(gift["sender_id"])
+                backpack_mgr.add_shared_item(
+                    gift["item_name"], gift.get("item_desc", ""),
+                    expires_at=gift.get("expires_at"),
+                )
+                logger.info(f"[Gift] 用户赠送超时退回：{gift['item_name']} → {gift['sender_name']}")
+        for key in expired_keys:
+            del self._pending_user_gifts[key]
+
+    @filter.regex(r"^(?:收到|好的|谢谢|收下|要|可以|ok|嗯|行|好|收了|拿了|接受|感谢|好嘞|好呀|好哒|嗯嗯|好啊|收到了|谢谢你|好耶|不要|不用|不收|拒绝|不了|算了|退回|不需要).*$")
+    async def on_user_gift_reply(self, event: AstrMessageEvent):
+        """监听自然语言接收/拒绝赠送"""
+        self._init_pending_gifts()
+        self._cleanup_expired_gifts()
+
+        if not self._pending_user_gifts:
+            return
+
+        group_id = event.get_group_id() or f"private_{event.get_sender_id()}"
+        pending_key = f"ug_{group_id}"
+
+        if pending_key not in self._pending_user_gifts:
+            return
+
+        gift = self._pending_user_gifts[pending_key]
+        sender_id = event.get_sender_id()
+
+        # 发送者自己的消息不算
+        if sender_id == gift["sender_id"]:
+            return
+
+        msg = event.message_str.strip()
+        reject_words = {"不要", "不用", "不收", "拒绝", "不了", "算了", "退回", "不需要"}
+        rejected = any(w in msg for w in reject_words)
+
+        replier_name = event.get_sender_name() or sender_id
+
+        if rejected:
+            # 拒绝 → 退回
+            _, backpack_mgr, _ = self._get_managers_for_user(gift["sender_id"])
+            backpack_mgr.add_shared_item(
+                gift["item_name"], gift.get("item_desc", ""),
+                expires_at=gift.get("expires_at"),
+            )
+            del self._pending_user_gifts[pending_key]
+            yield event.plain_result(
+                f"{replier_name}不想要「{gift['item_name']}」，已退回{gift['sender_name']}的背包~"
+            )
+        else:
+            # 接受
+            del self._pending_user_gifts[pending_key]
+            yield event.plain_result(
+                f"「{gift['item_name']}」送出成功！{replier_name}收下了{gift['sender_name']}的心意~"
+            )
 
     # ===============================================================
     #  小游戏：猜数字
