@@ -167,6 +167,13 @@ class PocketMoneyPlugin(Star):
             f"只有{self._admin_name()}能操作哦",
         )
 
+    @staticmethod
+    def _unwrap_event(event):
+        """兼容 AstrBot 新版框架：LLM工具可能收到 ContextWrapper 而非 AstrMessageEvent"""
+        if hasattr(event, 'context') and hasattr(event.context, 'event'):
+            return event.context.event
+        return event
+
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         return event.role == "admin"
 
@@ -2427,6 +2434,7 @@ class PocketMoneyPlugin(Star):
         Args:
             action(string): "开启"或"关闭"
         '''
+        event = self._unwrap_event(event)
         if "关" in action or "off" in action.lower():
             self._set_games_llm(False)
             return "🔋 游戏节能模式已开启，所有游戏LLM工具已关闭。文字指令（如「签到」「逛超市」）仍可正常使用。"
@@ -2444,6 +2452,7 @@ class PocketMoneyPlugin(Star):
 
         Args:
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         user_name = event.get_sender_name() or user_id
         success, xp, streak, new_level = self.level_manager.sign_in(user_id)
@@ -2464,6 +2473,7 @@ class PocketMoneyPlugin(Star):
 
         Args:
         '''
+        event = self._unwrap_event(event)
         return self.shop_manager.format_shop_list()
 
     @llm_tool(name="pm_browse_shop")
@@ -2473,6 +2483,7 @@ class PocketMoneyPlugin(Star):
         Args:
             shop_name(string): 店铺名称，如"蛋糕店"、"烤肉店"、"寿司店"等
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         result = self.shop_manager.browse_shop(shop_name, user_id)
         if result:
@@ -2504,6 +2515,7 @@ class PocketMoneyPlugin(Star):
         Args:
             item_name(string): 商品名称
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         money_mgr, backpack_mgr, is_isolated = self._get_managers_for_user(user_id)
 
@@ -2536,6 +2548,7 @@ class PocketMoneyPlugin(Star):
 
         Args:
         '''
+        event = self._unwrap_event(event)
         user_level = self.level_manager.get_level(event.get_sender_id())
         return self.games_manager.format_stock_market(user_level, user_id=event.get_sender_id())
 
@@ -2547,6 +2560,7 @@ class PocketMoneyPlugin(Star):
             code(string): 股票代码
             shares(string): 数量
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
         try:
@@ -2579,6 +2593,7 @@ class PocketMoneyPlugin(Star):
             code(string): 股票代码
             shares(string): 数量
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         money_mgr, _, _ = self._get_managers_for_user(user_id)
         try:
@@ -2600,6 +2615,7 @@ class PocketMoneyPlugin(Star):
 
         Args:
         '''
+        event = self._unwrap_event(event)
         return self.games_manager.format_user_portfolio(event.get_sender_id())
 
     @llm_tool(name="pm_check_balance")
@@ -2608,6 +2624,7 @@ class PocketMoneyPlugin(Star):
 
         Args:
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         money_mgr, backpack_mgr, _ = self._get_managers_for_user(user_id)
         items = backpack_mgr.get_user_items(user_id)
@@ -2620,6 +2637,7 @@ class PocketMoneyPlugin(Star):
 
         Args:
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
         ticket_price = 3
@@ -2640,6 +2658,7 @@ class PocketMoneyPlugin(Star):
 
         Args:
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
         bet = self._cfg("slots_bet", 5)
@@ -2661,6 +2680,7 @@ class PocketMoneyPlugin(Star):
         Args:
             bet(string): 下注金额
         '''
+        event = self._unwrap_event(event)
         self.__init_blackjack_sessions()
         session_key = self._bj_session_key(event)
 
@@ -2725,6 +2745,7 @@ class PocketMoneyPlugin(Star):
             item_name(string): 物品名称
             to_user(string): 收礼人的名字，留空则送给说话的人自己
         '''
+        event = self._unwrap_event(event)
         self._init_pending_gifts()
         user_id = event.get_sender_id()
         user_name = event.get_sender_name() or user_id
@@ -2792,6 +2813,7 @@ class PocketMoneyPlugin(Star):
         Args:
             item_name(string): 物品名称
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         user_name = event.get_sender_name() or "用户"
         _, backpack_mgr, _ = self._get_managers_for_user(user_id)
@@ -2848,6 +2870,7 @@ class PocketMoneyPlugin(Star):
             item_names(string): 物品名称，多个用逗号/顿号分隔
             to_user(string): 对方bot的名字
         '''
+        event = self._unwrap_event(event)
         if not self._gift_bot_name:
             return "赠送功能未配置bot名称（gift_bot_name）"
 
@@ -3273,6 +3296,7 @@ class PocketMoneyPlugin(Star):
             spread_type(string): 牌阵类型：默认"三牌"。可选"单牌"(1张2元)、"三牌"(3张5元)、"六芒星"(6张10元)、"日运"(免费每天一次)
             question(string): 提问者的问题（可选）
         '''
+        event = self._unwrap_event(event)
         user_id = event.get_sender_id()
         money_mgr, _, is_isolated = self._get_managers_for_user(user_id)
 
@@ -3385,7 +3409,7 @@ class PocketMoneyPlugin(Star):
 
     @filter.regex(r"^(?:收到|好的|谢谢|收下|要|可以|ok|嗯|行|好|收了|拿了|接受|感谢|好嘞|好呀|好哒|嗯嗯|好啊|收到了|谢谢你|好耶|不要|不用|不收|拒绝|不了|算了|退回|不需要).*$")
     async def on_user_gift_reply(self, event: AstrMessageEvent):
-        """监听自然语言接收/拒绝赠送"""
+        """监听自然语言接收/拒绝赠送（只有被指定的收礼人才能回复）"""
         self._init_pending_gifts()
         self._cleanup_expired_gifts()
 
@@ -3401,18 +3425,23 @@ class PocketMoneyPlugin(Star):
         gift = self._pending_user_gifts[pending_key]
         sender_id = event.get_sender_id()
 
-        # 发送者自己的消息不算
+        # 发送者自己不算
         if sender_id == gift["sender_id"]:
             return
+
+        # 只有被指定的收礼人才能接收/拒绝
+        replier_name = event.get_sender_name() or ""
+        recipient_name = gift.get("recipient_name", "")
+        if recipient_name:
+            # 模糊匹配收礼人名字
+            if recipient_name not in replier_name and replier_name not in recipient_name:
+                return  # 不是收礼人，忽略
 
         msg = event.message_str.strip()
         reject_words = {"不要", "不用", "不收", "拒绝", "不了", "算了", "退回", "不需要"}
         rejected = any(w in msg for w in reject_words)
 
-        replier_name = event.get_sender_name() or sender_id
-
         if rejected:
-            # 拒绝 → 退回
             _, backpack_mgr, _ = self._get_managers_for_user(gift["sender_id"])
             backpack_mgr.add_shared_item(
                 gift["item_name"], gift.get("item_desc", ""),
@@ -3423,7 +3452,6 @@ class PocketMoneyPlugin(Star):
                 f"{replier_name}不想要「{gift['item_name']}」，已退回{gift['sender_name']}的背包~"
             )
         else:
-            # 接受
             del self._pending_user_gifts[pending_key]
             yield event.plain_result(
                 f"「{gift['item_name']}」送出成功！{replier_name}收下了{gift['sender_name']}的心意~"
@@ -3601,6 +3629,7 @@ class PocketMoneyPlugin(Star):
         Args:
             bet(string): 下注金额
         '''
+        event = self._unwrap_event(event)
         ok, bet_val = self._parse_amount(bet)
         if not ok:
             return f"错误：{bet_val}"
