@@ -2735,76 +2735,37 @@ class PocketMoneyPlugin(Star):
     # ===============================================================
 
     @llm_tool(name="pm_give_to_user")
-    async def tool_give_to_user(self, event: AstrMessageEvent, item_name: str, to_user: str = ""):
-        '''把背包里的物品送给群里的某个人。
-        - to_user为空 → 送给自己（享用物品）
-        - to_user有值 → 送给那个人，等ta自然语言回复"收到/好的/谢谢"就完成
-        送出后请用人设描写场景。
+    async def tool_give_to_user(self, event: AstrMessageEvent, item_name: str):
+        '''（管理员专用）把共享背包的物品挪到某个用户的专属格子里。
 
         Args:
             item_name(string): 物品名称
-            to_user(string): 收礼人的名字，留空则送给说话的人自己
         '''
         event = self._unwrap_event(event)
-        self._init_pending_gifts()
+        if not self._is_admin(event):
+            return "挪格子是管理员功能。送东西给别人请直接说「送个xx给xx」~"
+
         user_id = event.get_sender_id()
         user_name = event.get_sender_name() or user_id
         _, backpack_mgr, _ = self._get_managers_for_user(user_id)
 
-        # 共享背包 + 用户格子都找
+        shared = backpack_mgr.get_shared_items()
         found = None
-        source = None
-        for item in backpack_mgr.get_shared_items():
+        for item in shared:
             if _name_match(item["name"], item_name):
                 found = item
-                source = "shared"
                 break
         if not found:
-            for item in backpack_mgr.get_user_items(user_id):
-                if _name_match(item["name"], item_name):
-                    found = item
-                    source = "user"
-                    break
-        if not found:
-            return f"背包里没有「{item_name}」"
+            return f"共享背包里没有「{item_name}」"
 
-        desc = found.get("description", found.get("desc", ""))
+        if backpack_mgr.is_user_slots_full(user_id):
+            return f"{user_name}的格子满了"
 
-        # 取出物品
-        if source == "shared":
-            backpack_mgr.use_shared_item(found["name"])
-        else:
-            backpack_mgr.use_user_item(user_id, found["name"])
-
-        recipient = to_user.strip() if to_user.strip() else ""
-        is_self = (not recipient) or (recipient == user_name)
-
-        if is_self:
-            return (
-                f"「{found['name']}」已取出（{desc}）。\n"
-                f"请用你的人设，描写一段和{user_name}一起享用/使用「{found['name']}」的互动场景，1-2句话。"
-            )
-        else:
-            # 存为待接收，等收礼人自然语言回复
-            import time
-            group_id = event.get_group_id() or f"private_{user_id}"
-            pending_key = f"ug_{group_id}"
-            self._pending_user_gifts[pending_key] = {
-                "item_name": found["name"],
-                "item_desc": desc,
-                "item_data": found,
-                "sender_id": user_id,
-                "sender_name": user_name,
-                "recipient_name": recipient,
-                "group_id": group_id,
-                "timestamp": time.time(),
-                "expires_at": found.get("expires_at"),
-            }
-            return (
-                f"「{found['name']}」已从背包取出，正在递给{recipient}。\n"
-                f"请用你的人设，描写把「{found['name']}」递给{recipient}的场景，"
-                f"然后问{recipient}要不要收下，等ta回复。"
-            )
+        desc = found.get("description", "")
+        expires = found.get("expires_at")
+        backpack_mgr.use_shared_item(found["name"])
+        backpack_mgr.add_user_gift(user_id, found["name"], desc, "背包赠送", expires_at=expires)
+        return f"已把「{found['name']}」放进{user_name}的专属格子"
 
     @llm_tool(name="pm_use_user_item")
     async def tool_use_user_item(self, event: AstrMessageEvent, item_name: str):
@@ -2863,92 +2824,105 @@ class PocketMoneyPlugin(Star):
             )
 
     @llm_tool(name="pm_gift_item")
-    async def tool_gift_item(self, event: AstrMessageEvent, item_names: str, to_user: str):
-        '''跨bot赠送（只有送给【其他bot】时才用，送给群里的人用pm_give_to_user）。对方bot会自动接收。
+    async def tool_gift_item(self, event: AstrMessageEvent, item_name: str, to_user: str):
+        '''送东西给别人（人或bot都行）。会发出赠送消息，等对方回复接收。
+        人回复"谢谢/收到"就行，bot会自动接收。
+        送出后请用人设描写递礼物的场景。
 
         Args:
-            item_names(string): 物品名称，多个用逗号/顿号分隔
-            to_user(string): 对方bot的名字
+            item_name(string): 物品名称
+            to_user(string): 收礼人名字
         '''
         event = self._unwrap_event(event)
+        self._init_pending_gifts()
+
         if not self._gift_bot_name:
             return "赠送功能未配置bot名称（gift_bot_name）"
 
         user_id = event.get_sender_id()
+        user_name = event.get_sender_name() or user_id
         _, backpack_mgr, _ = self._get_managers_for_user(user_id)
 
-        # 解析多个物品名
-        import re as _re
-        names = [n.strip() for n in _re.split(r'[,，、]', item_names) if n.strip()]
-        if not names:
-            return "请指定要赠送的物品名称"
-
-        # 先收集所有要赠送的物品（验证阶段，不修改数据）
-        found_items = []
-        not_found = []
-        for name in names:
+        # 送给bot自己 → 直接收下
+        bot_name = self._gift_bot_name or ""
+        if bot_name and to_user.strip() and (
+            to_user.strip() in bot_name or bot_name in to_user.strip()
+        ):
             found = None
-            source = None
-            # 先找用户格子
-            items = backpack_mgr.get_user_items(user_id)
-            for item in items:
-                if _name_match(item["name"], name):
-                    found = item
-                    source = "user"
-                    break
-            # 再找共享背包
+            for item in backpack_mgr.get_shared_items():
+                if _name_match(item["name"], item_name):
+                    found = item; break
             if not found:
-                shared = backpack_mgr.get_shared_items()
-                for item in shared:
-                    if _name_match(item["name"], name):
-                        found = item
-                        source = "shared"
-                        break
-            if found:
-                found_items.append((found, source))
-            else:
-                not_found.append(name)
-
-        if not found_items:
-            return f"背包里没有找到这些物品：{'、'.join(not_found)}"
-
-        # 执行赠送（修改数据阶段）
-        sent_names = []
-        for found, source in found_items:
-            # 从背包取出
-            if source == "shared":
-                backpack_mgr.use_shared_item(found["name"])
-            else:
-                backpack_mgr.use_user_item(user_id, found["name"])
-
-            # 创建赠送记录
-            record = self.gift_manager.create_outgoing(
-                item_name=found["name"],
-                item_desc=found.get("description", found.get("desc", "")),
-                from_bot=self._gift_bot_name,
-                to_user=to_user,
-                sender_user_id=user_id,
-                expires_at=found.get("expires_at"),
+                for item in backpack_mgr.get_user_items(user_id):
+                    if _name_match(item["name"], item_name):
+                        found = item; break
+            if not found:
+                return f"背包里没有「{item_name}」"
+            # 不用取出再放回，直接留在背包
+            return (
+                f"{user_name}送了「{found['name']}」给你！\n"
+                f"请用你的人设，开心地描写收到「{found['name']}」的反应，1-2句话。"
             )
 
-            # 发送赠送消息
-            gift_msg = GiftManager.format_gift_offer(
-                self._gift_bot_name, found["name"], to_user,
-                record["timestamp"], record["signature"],
-            )
-            await event.send(event.plain_result(gift_msg))
-            sent_names.append(found["name"])
+        # 找物品
+        found = None
+        source = None
+        for item in backpack_mgr.get_user_items(user_id):
+            if _name_match(item["name"], item_name):
+                found = item; source = "user"; break
+        if not found:
+            for item in backpack_mgr.get_shared_items():
+                if _name_match(item["name"], item_name):
+                    found = item; source = "shared"; break
+        if not found:
+            return f"背包里没有「{item_name}」"
 
-        result_parts = []
-        if sent_names:
-            names_str = '、'.join(f'「{n}」' for n in sent_names)
-            result_parts.append(
-                f"已把{names_str}打包好发给{to_user}了（等待对方接收，5分钟超时退回）。\n"
-                f"请用你的人设，描写帮用户准备礼物给{to_user}的场景，1-2句话。"
-            )
-        if not_found:
-            result_parts.append(f"以下物品没找到：{'、'.join(not_found)}")
-        return "。".join(result_parts)
+        # 取出物品
+        if source == "shared":
+            backpack_mgr.use_shared_item(found["name"])
+        else:
+            backpack_mgr.use_user_item(user_id, found["name"])
+
+        desc = found.get("description", found.get("desc", ""))
+
+        # 创建协议赠送记录（带密钥签名）
+        record = self.gift_manager.create_outgoing(
+            item_name=found["name"],
+            item_desc=desc,
+            from_bot=self._gift_bot_name,
+            to_user=to_user.strip(),
+            sender_user_id=user_id,
+            expires_at=found.get("expires_at"),
+        )
+
+        # 发送带密钥的协议消息（人和bot都能看到）
+        gift_msg = GiftManager.format_gift_offer(
+            self._gift_bot_name, found["name"], to_user.strip(),
+            record["timestamp"], record["signature"],
+        )
+        await event.send(event.plain_result(gift_msg))
+
+        # 同时创建自然语言待接收记录（给人用的）
+        import time
+        group_id = event.get_group_id() or f"private_{user_id}"
+        pending_key = f"ug_{group_id}"
+        self._pending_user_gifts[pending_key] = {
+            "item_name": found["name"],
+            "item_desc": desc,
+            "item_data": found,
+            "sender_id": user_id,
+            "sender_name": user_name,
+            "recipient_name": to_user.strip(),
+            "group_id": group_id,
+            "timestamp": time.time(),
+            "expires_at": found.get("expires_at"),
+            "gift_record_ts": record["timestamp"],  # 关联协议记录
+        }
+
+        return (
+            f"「{found['name']}」已发出赠送给{to_user.strip()}。\n"
+            f"请用你的人设，描写把「{found['name']}」递给{to_user.strip()}的场景，1-2句话。"
+        )
 
     @filter.regex(r"「.+?」发起赠送「.+?」给 @.+?，是否接收？\[GK:[a-f0-9]{6}:\d+\]")
     async def on_gift_offer(self, event: AstrMessageEvent):
@@ -3058,6 +3032,12 @@ class PocketMoneyPlugin(Star):
 
         if parsed["accepted"]:
             self.gift_manager.mark_accepted(parsed["item_name"], self._gift_bot_name)
+            # 清理自然语言待接收记录（bot先接收了）
+            self._init_pending_gifts()
+            group_id = event.get_group_id() or ""
+            pk = f"ug_{group_id}"
+            if pk in self._pending_user_gifts and self._pending_user_gifts[pk].get("item_name") == parsed["item_name"]:
+                del self._pending_user_gifts[pk]
             # 调API说一句话
             flavor = "送出去啦~"
             try:
@@ -3078,6 +3058,12 @@ class PocketMoneyPlugin(Star):
         else:
             # 拒绝 → 物品退回
             self.gift_manager.mark_rejected(parsed["item_name"], self._gift_bot_name)
+            # 清理自然语言待接收记录
+            self._init_pending_gifts()
+            group_id = event.get_group_id() or ""
+            pk = f"ug_{group_id}"
+            if pk in self._pending_user_gifts and self._pending_user_gifts[pk].get("item_name") == parsed["item_name"]:
+                del self._pending_user_gifts[pk]
             sender_id = record.get("sender_user_id", "")
             _, backpack_mgr, _ = self._get_managers_for_user(sender_id)
             backpack_mgr.add_shared_item(
@@ -3448,11 +3434,21 @@ class PocketMoneyPlugin(Star):
                 expires_at=gift.get("expires_at"),
             )
             del self._pending_user_gifts[pending_key]
+            # 同步清理协议记录（防止重复退回）
+            try:
+                self.gift_manager.cancel_outgoing(gift.get("gift_record_ts"))
+            except Exception:
+                pass
             yield event.plain_result(
                 f"{replier_name}不想要「{gift['item_name']}」，已退回{gift['sender_name']}的背包~"
             )
         else:
             del self._pending_user_gifts[pending_key]
+            # 同步标记协议记录完成（防止超时退回）
+            try:
+                self.gift_manager.complete_outgoing(gift.get("gift_record_ts"))
+            except Exception:
+                pass
             yield event.plain_result(
                 f"「{gift['item_name']}」送出成功！{replier_name}收下了{gift['sender_name']}的心意~"
             )
