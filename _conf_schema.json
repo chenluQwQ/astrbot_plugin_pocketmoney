@@ -17,6 +17,13 @@
         "default": "",
         "hint": "用于跨bot赠送的bot名称，如「霜序」。留空则关闭赠送。"
     },
+    "gift_judge_provider": {
+        "description": "礼物接收判断 Provider（小模型）",
+        "type": "string",
+        "default": "",
+        "hint": "用于判断真人回复是接收、拒绝还是无关。建议选择便宜小模型；留空则使用当前聊天模型。",
+        "_special": "select_provider"
+    },
     "shop_settings": {
         "description": "超市设置",
         "type": "object",

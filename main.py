@@ -113,6 +113,7 @@ class PocketMoneyPlugin(Star):
 
         # 赠送系统配置
         self._gift_bot_name = cfg("gift_bot_name", "")
+        self._gift_judge_provider = cfg("gift_judge_provider", "")
 
         # 从配置加载黑名单
         for uid in cfg("blacklist_users", []):
@@ -176,6 +177,94 @@ class PocketMoneyPlugin(Star):
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         return event.role == "admin"
+
+    def _is_admin_recipient(self, recipient: str) -> bool:
+        """赠送目标是管理员时，按用户自然语言赠送处理。"""
+        name = (recipient or "").strip().lstrip("@").strip()
+        admin_name = (self._admin_name() or "").strip()
+        if not name or not admin_name:
+            return False
+        return name == admin_name or name in admin_name or admin_name in name
+
+    async def _gift_persona_reply(self, event: AstrMessageEvent, prompt: str, fallback: str) -> str:
+        """用当前聊天模型生成一条礼物场景回复；失败时回退固定文本。"""
+        try:
+            umo = event.unified_msg_origin
+            prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if not prov_id:
+                return fallback
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=prov_id,
+                prompt=(
+                    "请遵循你当前聊天中的人设、语气和关系设定，只回复一句自然的话，"
+                    "不要解释规则，不要输出JSON，不要输出系统标记。\n"
+                    f"{prompt}"
+                ),
+            )
+            text = (llm_resp.completion_text or "").strip()
+            return text or fallback
+        except Exception as e:
+            logger.debug(f"[Gift] 人设回复生成失败: {e}")
+            return fallback
+
+    async def _judge_user_gift_reply(
+        self,
+        event: AstrMessageEvent,
+        gift: Dict[str, Any],
+        message: str,
+    ) -> str:
+        """判断用户对待接收礼物的自然语言回复：accept / reject / ignore。"""
+        msg = (message or "").strip()
+        if not msg:
+            return "ignore"
+
+        try:
+            prov_id = self._gift_judge_provider
+            if not prov_id:
+                umo = event.unified_msg_origin
+                prov_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if prov_id:
+                prompt = (
+                    "你是礼物接收意图分类器，请判断用户回复是否表示接收、拒绝，还是暂不处理。\n"
+                    "只输出JSON，不要解释。\n"
+                    '格式：{"action":"accept|reject|ignore"}\n\n'
+                    f"送礼人：{gift.get('sender_name', '')}\n"
+                    f"收礼人：{gift.get('recipient_name', '')}\n"
+                    f"礼物：{gift.get('item_name', '')}\n"
+                    f"礼物描述：{gift.get('item_desc', '')}\n"
+                    f"用户回复：{msg}\n\n"
+                    "判断规则：明确想要、感谢、收下、让对方给、同意都算accept；"
+                    "明确不要、拒绝、退回、用不上都算reject；"
+                    "询问、犹豫、闲聊、命令、无关内容都算ignore。"
+                )
+                llm_resp = await self.context.llm_generate(
+                    chat_provider_id=prov_id,
+                    prompt=prompt,
+                )
+                text = (llm_resp.completion_text or "").strip()
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                data = json.loads(text)
+                action = str(data.get("action", "")).strip().lower()
+                if action in {"accept", "reject", "ignore"}:
+                    return action
+        except Exception as e:
+            logger.debug(f"[Gift] 礼物接收意图判断失败，回退关键词: {e}")
+
+        reject_words = {"不要", "不用", "不收", "拒绝", "不了", "算了", "退回", "不需要", "用不上"}
+        accept_words = {
+            "收到", "好的", "谢谢", "收下", "要", "可以", "ok", "嗯", "行", "好",
+            "收了", "拿了", "接受", "感谢", "好嘞", "好呀", "好哒", "嗯嗯",
+            "好啊", "收到了", "谢谢你", "好耶", "拿来", "给我",
+        }
+        lowered = msg.lower()
+        if any(w in msg for w in reject_words):
+            return "reject"
+        if any(w in msg for w in accept_words) or lowered in {"ok", "okay", "yes", "y"}:
+            return "accept"
+        return "ignore"
 
     def _parse_amount(self, amount_str: str, allow_zero: bool = False) -> tuple:
         try:
@@ -2825,13 +2914,12 @@ class PocketMoneyPlugin(Star):
 
     @llm_tool(name="pm_gift_item")
     async def tool_gift_item(self, event: AstrMessageEvent, item_name: str, to_user: str):
-        '''送东西给别人（人或bot都行）。会发出赠送消息，等对方回复接收。
-        人回复"谢谢/收到"就行，bot会自动接收。
-        送出后请用人设描写递礼物的场景。
+        '''送东西给别人。由于无法可靠判断群成员是不是bot：收礼人匹配管理员名时只走用户赠送；其他收礼人会先发跨bot协议，同时保留自然语言待接收，真人回复"谢谢/收到/不要"也能处理。
+        送出后请用当前人设描写递礼物的场景，不要改写协议码。
 
         Args:
             item_name(string): 物品名称
-            to_user(string): 收礼人名字
+            to_user(string): 收礼人名字。填管理员名会只走用户赠送；其他名字会同时支持bot协议和真人自然语言接收
         '''
         event = self._unwrap_event(event)
         self._init_pending_gifts()
@@ -2884,6 +2972,31 @@ class PocketMoneyPlugin(Star):
             backpack_mgr.use_user_item(user_id, found["name"])
 
         desc = found.get("description", found.get("desc", ""))
+        recipient = to_user.strip().lstrip("@").strip()
+        is_admin_recipient = self._is_admin_recipient(recipient)
+
+        if is_admin_recipient:
+            # 管理员按用户赠送处理：不发送跨bot协议码，等待自然语言接收/拒绝。
+            import time
+            group_id = event.get_group_id() or f"private_{user_id}"
+            pending_key = f"ug_{group_id}"
+            self._pending_user_gifts[pending_key] = {
+                "item_name": found["name"],
+                "item_desc": desc,
+                "item_data": found,
+                "sender_id": user_id,
+                "sender_name": user_name,
+                "recipient_name": recipient,
+                "group_id": group_id,
+                "timestamp": time.time(),
+                "expires_at": found.get("expires_at"),
+                "gift_record_ts": None,
+            }
+            return (
+                f"「{found['name']}」已递给{recipient}，正在等对方接收或拒绝。\n"
+                f"请用你的人设，描写把「{found['name']}」递给{recipient}的场景，1-2句话，"
+                f"并自然地提醒对方可以回复收到/谢谢或不要。"
+            )
 
         # 创建协议赠送记录（带密钥签名）
         record = self.gift_manager.create_outgoing(
@@ -2902,7 +3015,7 @@ class PocketMoneyPlugin(Star):
         )
         await event.send(event.plain_result(gift_msg))
 
-        # 同时创建自然语言待接收记录（给人用的）
+        # 非管理员目标无法可靠判断是不是 bot：协议给 bot 解析，自然语言待接收给真人兜底。
         import time
         group_id = event.get_group_id() or f"private_{user_id}"
         pending_key = f"ug_{group_id}"
@@ -2912,16 +3025,17 @@ class PocketMoneyPlugin(Star):
             "item_data": found,
             "sender_id": user_id,
             "sender_name": user_name,
-            "recipient_name": to_user.strip(),
+            "recipient_name": recipient,
             "group_id": group_id,
             "timestamp": time.time(),
             "expires_at": found.get("expires_at"),
-            "gift_record_ts": record["timestamp"],  # 关联协议记录
+            "gift_record_ts": record["timestamp"],
         }
 
         return (
-            f"「{found['name']}」已发出赠送给{to_user.strip()}。\n"
-            f"请用你的人设，描写把「{found['name']}」递给{to_user.strip()}的场景，1-2句话。"
+            f"「{found['name']}」已通过跨bot协议发出赠送给{recipient}。\n"
+            f"如果对方是真人，也可以回复收到/谢谢或不要。\n"
+            f"请用你的人设，补一句把「{found['name']}」送出去时的反应或动作，1-2句话。"
         )
 
     @filter.regex(r"「.+?」发起赠送「.+?」给 @.+?，是否接收？\[GK:[a-f0-9]{6}:\d+\]")
@@ -2969,7 +3083,8 @@ class PocketMoneyPlugin(Star):
             if prov_id:
                 prompt = (
                     f"有人（{parsed['bot_name']}）要送你一个「{parsed['item_name']}」。"
-                    f"你要接受吗？请只回复一个JSON："
+                    f"请遵循你当前聊天中的人设判断要不要接受，并让reply符合你的说话方式。"
+                    f"请只回复一个JSON："
                     f'{{"accept": true/false, "reply": "你的一句话回复"}}'
                 )
                 llm_resp = await self.context.llm_generate(
@@ -3046,7 +3161,7 @@ class PocketMoneyPlugin(Star):
                 if prov_id:
                     prompt = (
                         f"{parsed['bot_name']}接收了你送出的「{parsed['item_name']}」。"
-                        f"请用一句话表达你的心情，直接回复这句话即可。"
+                        f"请遵循你当前聊天中的人设，用一句话表达你的心情，直接回复这句话即可。"
                     )
                     llm_resp = await self.context.llm_generate(
                         chat_provider_id=prov_id, prompt=prompt,
@@ -3078,7 +3193,7 @@ class PocketMoneyPlugin(Star):
                 if prov_id:
                     prompt = (
                         f"{parsed['bot_name']}拒绝了你送出的「{parsed['item_name']}」。"
-                        f"请用一句话表达你的心情，直接回复这句话即可。"
+                        f"请遵循你当前聊天中的人设，用一句话表达你的心情，直接回复这句话即可。"
                     )
                     llm_resp = await self.context.llm_generate(
                         chat_provider_id=prov_id, prompt=prompt,
@@ -3393,9 +3508,9 @@ class PocketMoneyPlugin(Star):
         for key in expired_keys:
             del self._pending_user_gifts[key]
 
-    @filter.regex(r"^(?:收到|好的|谢谢|收下|要|可以|ok|嗯|行|好|收了|拿了|接受|感谢|好嘞|好呀|好哒|嗯嗯|好啊|收到了|谢谢你|好耶|不要|不用|不收|拒绝|不了|算了|退回|不需要).*$")
+    @filter.regex(r"[\s\S]+")
     async def on_user_gift_reply(self, event: AstrMessageEvent):
-        """监听自然语言接收/拒绝赠送（只有被指定的收礼人才能回复）"""
+        """监听自然语言接收/拒绝赠送（交给小模型判断 accept/reject/ignore）"""
         self._init_pending_gifts()
         self._cleanup_expired_gifts()
 
@@ -3420,12 +3535,21 @@ class PocketMoneyPlugin(Star):
         recipient_name = gift.get("recipient_name", "")
         if recipient_name:
             # 模糊匹配收礼人名字
-            if recipient_name not in replier_name and replier_name not in recipient_name:
+            if (
+                recipient_name not in replier_name
+                and replier_name not in recipient_name
+                and not self._is_admin(event)
+            ):
                 return  # 不是收礼人，忽略
 
         msg = event.message_str.strip()
-        reject_words = {"不要", "不用", "不收", "拒绝", "不了", "算了", "退回", "不需要"}
-        rejected = any(w in msg for w in reject_words)
+        if re.search(r"\[G[AKR]:[a-f0-9]{6}:\d+\]", msg):
+            return
+
+        action = await self._judge_user_gift_reply(event, gift, msg)
+        if action == "ignore":
+            return
+        rejected = action == "reject"
 
         if rejected:
             _, backpack_mgr, _ = self._get_managers_for_user(gift["sender_id"])
@@ -3439,19 +3563,53 @@ class PocketMoneyPlugin(Star):
                 self.gift_manager.cancel_outgoing(gift.get("gift_record_ts"))
             except Exception:
                 pass
-            yield event.plain_result(
-                f"{replier_name}不想要「{gift['item_name']}」，已退回{gift['sender_name']}的背包~"
+            reply = await self._gift_persona_reply(
+                event,
+                (
+                    f"{replier_name}拒绝了{gift['sender_name']}送来的「{gift['item_name']}」，"
+                    f"物品已经退回。请用人设说一句自然的回应。"
+                ),
+                f"{replier_name}不想要「{gift['item_name']}」，已退回{gift['sender_name']}的背包~",
             )
+            yield event.plain_result(reply)
         else:
+            _, recipient_backpack_mgr, _ = self._get_managers_for_user(sender_id)
+            added = recipient_backpack_mgr.add_user_gift(
+                sender_id,
+                gift["item_name"],
+                gift.get("item_desc", ""),
+                gift["sender_name"],
+                expires_at=gift.get("expires_at"),
+            )
             del self._pending_user_gifts[pending_key]
             # 同步标记协议记录完成（防止超时退回）
             try:
                 self.gift_manager.complete_outgoing(gift.get("gift_record_ts"))
             except Exception:
                 pass
-            yield event.plain_result(
-                f"「{gift['item_name']}」送出成功！{replier_name}收下了{gift['sender_name']}的心意~"
+            if added:
+                fallback = f"「{gift['item_name']}」送出成功！{replier_name}收下了{gift['sender_name']}的心意~"
+                prompt = (
+                    f"{replier_name}收下了{gift['sender_name']}送来的「{gift['item_name']}」。"
+                    f"请用人设说一句自然的回应。"
+                )
+            else:
+                _, sender_backpack_mgr, _ = self._get_managers_for_user(gift["sender_id"])
+                sender_backpack_mgr.add_shared_item(
+                    gift["item_name"], gift.get("item_desc", ""),
+                    expires_at=gift.get("expires_at"),
+                )
+                fallback = f"{replier_name}的专属格子满了，「{gift['item_name']}」已退回{gift['sender_name']}的背包。"
+                prompt = (
+                    f"{replier_name}想收下「{gift['item_name']}」，但专属格子满了，物品已经退回。"
+                    f"请用人设说一句自然的回应。"
+                )
+            reply = await self._gift_persona_reply(
+                event,
+                prompt,
+                fallback,
             )
+            yield event.plain_result(reply)
 
     # ===============================================================
     #  小游戏：猜数字
