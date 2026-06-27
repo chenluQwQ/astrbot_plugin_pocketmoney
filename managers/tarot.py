@@ -109,15 +109,16 @@ class TarotManager:
     def _load_data(self) -> Dict[str, Any]:
         path = os.path.join(self.data_dir, "tarot.json")
         if not os.path.exists(path):
-            return {"daily_records": {}, "user_stats": {}}
+            return {"daily_records": {}, "daily_fortunes": {}, "user_stats": {}}
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 data.setdefault("daily_records", {})
+                data.setdefault("daily_fortunes", {})
                 data.setdefault("user_stats", {})
                 return data
         except (json.JSONDecodeError, TypeError):
-            return {"daily_records": {}, "user_stats": {}}
+            return {"daily_records": {}, "daily_fortunes": {}, "user_stats": {}}
 
     def _save_data(self):
         path = os.path.join(self.data_dir, "tarot.json")
@@ -463,6 +464,21 @@ class TarotManager:
         )
         return prompt
 
+    @staticmethod
+    def build_daily_fallback(cards: List[Dict]) -> str:
+        """无 LLM 时的日运兜底解读，避免只返回牌面。"""
+        labels = ["总运", "事业/学业", "感情"]
+        parts = []
+        for i, card in enumerate(cards[:3]):
+            label = labels[i]
+            name = card.get("name", "未知牌")
+            position = card.get("position", "")
+            keywords = card.get("keywords", "")
+            tone = "顺势推进" if position == "正位" else "放慢一点"
+            parts.append(f"{label}看「{name}」{position}，关键词是{keywords}，今天适合{tone}。")
+        advice = "整体建议：先稳住节奏，把最重要的一件事做好。"
+        return "\n".join(parts + [advice])
+
     # ============================================================
     #  日运限制
     # ============================================================
@@ -472,10 +488,25 @@ class TarotManager:
         today = datetime.now().strftime("%Y-%m-%d")
         return self.data.get("daily_records", {}).get(user_id) == today
 
-    def record_daily_fortune(self, user_id: str):
-        """记录用户今天已看日运"""
+    def get_daily_fortune_record(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """获取用户今天已保存的日运内容。"""
         today = datetime.now().strftime("%Y-%m-%d")
+        record = self.data.get("daily_fortunes", {}).get(str(user_id))
+        if isinstance(record, dict) and record.get("date") == today:
+            return record
+        return None
+
+    def record_daily_fortune(self, user_id: str, cards: List[Dict] = None, interpretation: str = ""):
+        """记录用户今天已看日运，并保存牌面和解读供重复查看。"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        user_id = str(user_id)
         self.data.setdefault("daily_records", {})[user_id] = today
+        if cards is not None:
+            self.data.setdefault("daily_fortunes", {})[user_id] = {
+                "date": today,
+                "cards": cards,
+                "interpretation": interpretation or "",
+            }
         self._save_data()
 
     # ============================================================

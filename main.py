@@ -3283,21 +3283,8 @@ class PocketMoneyPlugin(Star):
 
         self._check_achievements(user_id)
 
-    @filter.command("今日运势")
-    async def daily_fortune(self, event: AstrMessageEvent):
-        """每日运势（免费，每日一次）"""
-        user_id = event.get_sender_id()
-
-        if self.tarot_manager.has_daily_fortune_today(user_id):
-            yield event.plain_result("🌅 你今天已经看过运势啦，明天再来~"); return
-
-        # 抽三张
-        cards = self.tarot_manager.draw_cards(3)
-        self.tarot_manager.record_daily_fortune(user_id)
-        self.tarot_manager.record_reading(user_id, "daily")
-
-        # LLM 解读
-        interpretation = ""
+    async def _generate_daily_fortune_interpretation(self, event: AstrMessageEvent, cards: List[Dict]) -> str:
+        """生成今日运势解读；LLM 不可用时返回本地兜底解读。"""
         try:
             umo = event.unified_msg_origin
             prov_id = await self.context.get_current_chat_provider_id(umo=umo)
@@ -3308,9 +3295,39 @@ class PocketMoneyPlugin(Star):
                 )
                 resp_text = (llm_resp.completion_text or "").strip()
                 if resp_text:
-                    interpretation = resp_text
+                    return resp_text
         except Exception as e:
             logger.debug(f"[Tarot] 日运 LLM 解读失败: {e}")
+        return TarotManager.build_daily_fallback(cards)
+
+    def _format_daily_fortune_record(self, record: Dict) -> str:
+        cards = record.get("cards") or []
+        interpretation = record.get("interpretation") or ""
+        if not cards:
+            return "🌅 你今天已经看过运势啦，但旧记录里没有保存牌面内容。明天再来抽新的吧~"
+        display = self.tarot_manager.format_daily_display(cards)
+        if interpretation:
+            display += f"\n\n🔮 解读：\n{interpretation}"
+        return display
+
+    @filter.command("每日运势")
+    @filter.command("日运")
+    @filter.command("今日运势")
+    async def daily_fortune(self, event: AstrMessageEvent):
+        """每日运势（免费，每日一次）"""
+        user_id = event.get_sender_id()
+
+        if self.tarot_manager.has_daily_fortune_today(user_id):
+            record = self.tarot_manager.get_daily_fortune_record(user_id)
+            yield event.plain_result(self._format_daily_fortune_record(record or {})); return
+
+        # 抽三张
+        cards = self.tarot_manager.draw_cards(3)
+
+        # LLM 解读
+        interpretation = await self._generate_daily_fortune_interpretation(event, cards)
+        self.tarot_manager.record_daily_fortune(user_id, cards, interpretation)
+        self.tarot_manager.record_reading(user_id, "daily")
 
         # 构造图文混排消息链
         daily_labels = ["总运", "事业/学业", "感情"]
@@ -3404,11 +3421,15 @@ class PocketMoneyPlugin(Star):
         # 日运特殊处理
         if "日运" in spread_type or "运势" in spread_type:
             if self.tarot_manager.has_daily_fortune_today(user_id):
-                return "今天已经看过运势啦，明天再来~"
+                record = self.tarot_manager.get_daily_fortune_record(user_id)
+                return f"请将以下今日运势原样发送给用户，不要改写：\n\n{self._format_daily_fortune_record(record or {})}"
             cards = self.tarot_manager.draw_cards(3)
-            self.tarot_manager.record_daily_fortune(user_id)
+            interpretation = await self._generate_daily_fortune_interpretation(event, cards)
+            self.tarot_manager.record_daily_fortune(user_id, cards, interpretation)
             self.tarot_manager.record_reading(user_id, "daily")
-            return f"请将以下牌面原样发送给用户，不要改写：\n\n{self.tarot_manager.format_daily_display(cards)}"
+            display = self.tarot_manager.format_daily_display(cards)
+            display += f"\n\n🔮 解读：\n{interpretation}"
+            return f"请将以下今日运势牌面和解读原样发送给用户，不要改写：\n\n{display}"
 
         # 解析牌阵
         spread_map = {
